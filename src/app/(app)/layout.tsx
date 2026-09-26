@@ -1,4 +1,8 @@
+import { connection } from "next/server";
+import Link from "next/link";
+import { redirect } from "next/navigation";
 import { signOut } from "@/auth";
+import { getSettings } from "@/server/services/setup";
 import { requireUser } from "@/server/auth/roles";
 import { orgName } from "@/server/queries/overview";
 import { unassignedCount } from "@/server/ledger/balances";
@@ -10,6 +14,9 @@ import { Badge } from "@/components/ui/badge";
 const ROLE_LABEL = { fiscus: "Fiscus", bestuur: "Bestuur", kascommissie: "Kascommissie" } as const;
 
 export default async function AppLayout({ children }: LayoutProps<"/">) {
+  await connection(); // always render per request (never prerender pages that read the database)
+  const settings = await getSettings(getDb());
+  if (!settings?.setupCompleted) redirect("/setup");
   const access = await requireUser();
   const name = await orgName();
   const items: NavItem[] = [];
@@ -59,7 +66,21 @@ export default async function AppLayout({ children }: LayoutProps<"/">) {
           </form>
         </div>
       </aside>
-      <main className="min-w-0 flex-1 p-4 md:p-8">{children}</main>
+      <main className="min-w-0 flex-1 p-4 md:p-8">
+        {settings.isDemo && (
+          <div className="mb-6 rounded-lg border border-sky-300 bg-sky-50 p-3 text-sm dark:border-sky-900 dark:bg-sky-950/40">
+            Dit is een <strong>voorbeelddispuut</strong> om rond te kijken.
+            {access.can("admin") && (
+              <>
+                {" "}
+                Klaar met kijken?{" "}
+                <Link href="/demo-wissen" className="underline underline-offset-4">Wis het en richt je eigen dispuut in</Link>.
+              </>
+            )}
+          </div>
+        )}
+        {children}
+      </main>
     </div>
   );
 }

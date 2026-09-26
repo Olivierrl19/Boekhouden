@@ -17,6 +17,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth(() => ({
     verificationTokensTable: schema.verificationTokens,
   }),
   session: { strategy: "database", maxAge: 30 * 24 * 60 * 60 },
+  trustHost: true,
   pages: { signIn: "/login", verifyRequest: "/login/check", error: "/login" },
   providers: [
     Nodemailer({

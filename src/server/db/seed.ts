@@ -19,6 +19,7 @@ import { assignTransaction, recordTransactions, type NormalizedBankTransaction }
 import { chargeContributionsForMonth } from "../services/contributions";
 import { createActivity, settleActivity } from "../services/activities";
 import { closeFiscalYear } from "../services/fiscal-years";
+import { markSetupCompleted } from "../services/install";
 import { postEntry, type Actor } from "../ledger/post";
 import { activityBalance, partyBalance, resultBalancesByPot } from "../ledger/balances";
 import { expenseClaimApproved, openingBalance, reserveDotation, type AssignmentTarget } from "@/domain/ledger/templates";
@@ -365,6 +366,7 @@ export async function seed(db: Db) {
         await bankTx(ctx, "checking", localDate("2026-09-24"), 2500, "ABN AMRO Bank NV", "Tikkie ID 000987654, Borrel sept, Dispuut Bacchus, NL44ABNA0123456789", IBAN.tikkie);
       },
     });
+    await markSetupCompleted(tx, { isDemo: true });
   });
 }
 

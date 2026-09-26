@@ -20,16 +20,28 @@ export interface PostedEntry {
   fiscalYearId: string;
 }
 
-async function resolveAccounts(tx: Tx, refs: AccountRef[]): Promise<Map<string, typeof schema.ledgerAccounts.$inferSelect>> {
-  const accounts = await tx.select().from(schema.ledgerAccounts);
-  const byKey = new Map<string, typeof schema.ledgerAccounts.$inferSelect>();
-  for (const a of accounts) {
+type LedgerAccount = typeof schema.ledgerAccounts.$inferSelect;
+// The chart of accounts is tiny and rarely changes; cache it per transaction/handle so bulk
+// operations (imports, monthly contribution) don't re-read it for every entry. A cache miss
+// triggers a re-read, so accounts created later in the same transaction are still found.
+const accountCache = new WeakMap<object, Map<string, LedgerAccount>>();
+
+async function loadAccounts(tx: Tx): Promise<Map<string, LedgerAccount>> {
+  const byKey = new Map<string, LedgerAccount>();
+  for (const a of await tx.select().from(schema.ledgerAccounts)) {
     byKey.set(`id:${a.id}`, a);
     if (a.systemKey) byKey.set(`key:${a.systemKey}`, a);
   }
-  const result = new Map<string, typeof schema.ledgerAccounts.$inferSelect>();
+  accountCache.set(tx, byKey);
+  return byKey;
+}
+
+async function resolveAccounts(tx: Tx, refs: AccountRef[]): Promise<Map<string, LedgerAccount>> {
+  let byKey = accountCache.get(tx) ?? (await loadAccounts(tx));
+  if (refs.some((r) => !byKey.has(refKey(r)))) byKey = await loadAccounts(tx);
+  const result = new Map<string, LedgerAccount>();
   for (const ref of refs) {
-    const k = "key" in ref ? `key:${ref.key}` : `id:${ref.id}`;
+    const k = refKey(ref);
     const account = byKey.get(k);
     if (!account) throw new LedgerError(`Onbekende grootboekrekening: ${k}`);
     result.set(k, account);

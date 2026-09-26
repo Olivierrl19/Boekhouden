@@ -10,8 +10,11 @@ declare global {
   var __boekhoudenSql: ReturnType<typeof postgres> | undefined;
 }
 
+// `prepare: false` keeps us compatible with poolers in transaction mode (Neon "-pooler" URLs).
+const OPTIONS = { max: Number(process.env.DATABASE_POOL_MAX ?? 5), prepare: false, onnotice: () => {} };
+
 export function createDb(url: string): { db: Db; sql: ReturnType<typeof postgres> } {
-  const sql = postgres(url, { max: 10, onnotice: () => {} });
+  const sql = postgres(url, OPTIONS);
   return { db: drizzle(sql, { schema }), sql };
 }
 
@@ -19,7 +22,7 @@ function getSql() {
   if (!globalThis.__boekhoudenSql) {
     const url = process.env.DATABASE_URL;
     if (!url) throw new Error("DATABASE_URL is not set");
-    globalThis.__boekhoudenSql = postgres(url, { max: 10, onnotice: () => {} });
+    globalThis.__boekhoudenSql = postgres(url, OPTIONS);
   }
   return globalThis.__boekhoudenSql;
 }

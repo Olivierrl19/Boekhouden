@@ -1,7 +1,10 @@
+import { connection } from "next/server";
 import { redirect } from "next/navigation";
 import { AuthError } from "next-auth";
 import { signIn } from "@/auth";
 import { getCurrentUser } from "@/server/auth/roles";
+import { getSettings } from "@/server/services/setup";
+import { getDb } from "@/server/db";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -28,6 +31,9 @@ const MESSAGES: Record<string, string> = {
 };
 
 export default async function LoginPage({ searchParams }: PageProps<"/login">) {
+  await connection();
+  const settings = await getSettings(getDb());
+  if (!settings?.setupCompleted) redirect("/setup");
   if (await getCurrentUser()) redirect("/");
   const { error } = await searchParams;
   const message = typeof error === "string" ? (MESSAGES[error] ?? "Inloggen is niet gelukt. Probeer het opnieuw.") : null;

@@ -12,7 +12,8 @@
     "db:seed": "tsx src/server/db/seed.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:unit": "vitest run --project unit"
+    "test:unit": "vitest run --project unit",
+    "vercel-build": "npm run db:migrate && next build"
   },
   "dependencies": {
     "@auth/drizzle-adapter": "^1.11.3",

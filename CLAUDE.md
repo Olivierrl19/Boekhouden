@@ -65,12 +65,15 @@ tests/                 DB integration and property tests (unit tests sit next to
 
 ## Commands
 
+Production runs on **Vercel (Hobby) + Neon (Free)**; no Docker. `npm run vercel-build` applies
+migrations (using `DATABASE_URL_UNPOOLED` if set) and then builds. First-run setup happens in the
+browser at `/setup` (guarded by `SETUP_CODE`); see README.
+
 ```bash
-docker compose up -d          # Postgres, Mailpit (SMTP on 1025, UI on 8025), MinIO
-npm run db:migrate            # apply migrations (drizzle/)
-npm run db:seed               # example association (resets the database!)
-npm run dev                   # http://localhost:3000 — without SMTP the magic link is printed to the console
-npm test                      # unit + DB tests (needs DATABASE_URL_TEST)
+npm run db:migrate            # apply migrations (drizzle/) to DATABASE_URL
+npm run db:seed               # demo association (resets the database!); also available as a button in /setup
+npm run dev                   # http://localhost:3000 — without EMAIL_SERVER the magic link is printed to the console
+npm test                      # unit + DB tests (needs DATABASE_URL_TEST, an empty Postgres database)
 npm run test:unit             # pure tests only, no database
 npm run typecheck && npm run lint
 npm run db:generate           # after changing schema.ts → new migration

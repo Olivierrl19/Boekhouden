@@ -55,6 +55,7 @@ export const orgSettings = pgTable(
     statementAutoSend: boolean("statement_auto_send").notNull().default(true),
     mailFrom: text("mail_from"),
     setupCompleted: boolean("setup_completed").notNull().default(false),
+    isDemo: boolean("is_demo").notNull().default(false),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
