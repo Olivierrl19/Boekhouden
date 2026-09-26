@@ -10,6 +10,7 @@ import { cents, formatEuro, sum, type Cents } from "@/domain/money";
 import { addMonths, firstOfMonth, formatDateNl, formatMonthNl, localDate, type LocalDate } from "@/domain/dates";
 import { formatIban } from "@/domain/bank/iban";
 import { currentFiscalYear, resultByPot, today, type Party, type State } from "../ledger";
+export type { Ledger as StatementLedger };
 import { A, Empty, Field, PageHeader, ReadOnlyNotice, Select, csvLine, download, go, parseAmount, useAction, useApp, useCan, useLedger } from "./core";
 import { lineTarget } from "./labels";
 
@@ -20,7 +21,9 @@ import { lineTarget } from "./labels";
 export function DashboardPage() {
   const { state, d } = useLedger();
   const fy = currentFiscalYear(state, today());
-  const persons = state.parties.map((p) => d.partyBalance.get(p.id) ?? 0);
+  const persons = state.parties.map((p) => owedBy(d, p.id).total as number);
+  const contributionOpen = sum(state.parties.map((p) => cents(Math.max(0, d.contributionBalance.get(p.id) ?? 0))));
+  const savingsTotal = sum([...d.savingsByParty.values()]);
   const openActs = state.activities.filter((a) => a.status === "open");
   const pnl = fy ? [...resultByPot(state, fy).values()].reduce((s, r) => s + r.income - r.expense, 0) : 0;
   const pendingClaims = state.claims.filter((c) => c.status === "submitted").length;
@@ -59,13 +62,15 @@ export function DashboardPage() {
         <A to="debiteuren"><Card><CardHeader><CardDescription>Tegoeden van personen</CardDescription><CardTitle className="text-xl"><Money value={-sum(persons.filter((b) => b < 0) as Cents[])} /></CardTitle></CardHeader></Card></A>
         <A to="activiteiten"><Card><CardHeader><CardDescription>Nog te verdelen ({openActs.length} activiteiten)</CardDescription><CardTitle className="text-xl"><Money value={sum(openActs.map((a) => d.activityBalance.get(a.id) ?? cents(0)))} /></CardTitle></CardHeader></Card></A>
         <A to="rapporten"><Card><CardHeader><CardDescription>Resultaat dit boekjaar</CardDescription><CardTitle className="text-xl"><Money value={pnl} /></CardTitle></CardHeader></Card></A>
+        <A to="contributie"><Card><CardHeader><CardDescription>Contributie nog te ontvangen</CardDescription><CardTitle className="text-xl"><Money value={contributionOpen} /></CardTitle></CardHeader></Card></A>
+        <A to="spaarplannen"><Card><CardHeader><CardDescription>Spaargeld van leden (bewaard)</CardDescription><CardTitle className="text-xl"><Money value={savingsTotal} /></CardTitle></CardHeader></Card></A>
       </div>
       <Card>
         <CardHeader><CardTitle>Te doen</CardTitle></CardHeader>
         <CardContent className="flex flex-col gap-2 text-sm">
           <Todo ok={d.unassigned.length === 0} to="bank">{d.unassigned.length === 0 ? "Alle bankregels toegewezen" : `${d.unassigned.length} bankregels toewijzen`}</Todo>
           <Todo ok={pendingClaims === 0} to="declaraties">{pendingClaims === 0 ? "Geen declaraties die wachten" : `${pendingClaims} declaratie(s) beoordelen`}</Todo>
-          <Todo ok={contributionDone} to="contributie">{contributionDone ? `Contributie ${formatMonthNl(thisMonth)} geboekt` : `Contributie ${formatMonthNl(thisMonth)} boeken`}</Todo>
+          <Todo ok={contributionDone} to="contributie">{contributionDone ? `Contributie ${formatMonthNl(thisMonth)} opgelegd` : `Contributie ${formatMonthNl(thisMonth)} opleggen`}</Todo>
           <Todo ok={d.unassigned.length === 0} to="debiteuren">Maandmail versturen {d.unassigned.length > 0 && "(pas als de boekhouding bij is)"}</Todo>
         </CardContent>
       </Card>
@@ -86,63 +91,101 @@ function Todo({ ok, to, children }: { ok: boolean; to: string; children: React.R
 // Person statements and the monthly mail
 // ---------------------------------------------------------------------------
 
-export function statementLines(state: State, partyId: string) {
+export type Ledger = "account" | "contribution" | "savings";
+const LEDGER_KEYS: Record<Ledger, string[]> = {
+  account: ["MEMBER_ACCOUNTS", "EXTERNAL_ACCOUNTS", "ACCOUNTS_PAYABLE"],
+  contribution: ["CONTRIBUTION_RECEIVABLE"],
+  savings: ["MEMBER_SAVINGS"],
+};
+
+/** A person's mutations on one of their three ledgers, oldest first, with running balance. */
+export function statementLines(state: State, partyId: string, ledger: Ledger = "account") {
   let running = 0;
+  const accounts = new Set(state.accounts.filter((a) => a.systemKey && LEDGER_KEYS[ledger].includes(a.systemKey)).map((a) => a.id));
+  const sign = ledger === "savings" ? -1 : 1; // savings: positive = saved
   const rows = state.entries
-    .flatMap((e) => e.lines.filter((l) => l.partyId === partyId).map((l) => ({ e, l })))
+    .flatMap((e) => e.lines.filter((l) => l.partyId === partyId && accounts.has(l.accountId)).map((l) => ({ e, l: { ...l, amount: cents(sign * l.amount) } })))
     .sort((a, b) => (a.e.date === b.e.date ? (a.e.entryNumber < b.e.entryNumber ? -1 : 1) : a.e.date < b.e.date ? -1 : 1))
     .map(({ e, l }) => {
       running += l.amount;
       const description = l.description ?? e.description;
-      const name = l.activityId ? state.activities.find((a) => a.id === l.activityId)?.name : null;
-      const activity = name && !description.includes(name) ? name : null;
+      const act = l.activityId ? state.activities.find((a) => a.id === l.activityId) : null;
+      const goal = l.savingsGoalId ? state.savingsGoals.find((g) => g.id === l.savingsGoalId)?.name : null;
+      const name = act ? `${act.number} ${act.name}` : goal;
+      const activity = name && !description.includes(act?.name ?? name) ? name : null;
       return { id: `${e.id}-${e.lines.indexOf(l)}`, date: e.date, description, activity, amount: l.amount, balance: cents(running), reversal: !!e.reversesEntryId };
     });
   return rows;
 }
 
+export function owedBy(d: ReturnType<typeof import("../ledger").derive>, partyId: string) {
+  const account = d.partyBalance.get(partyId) ?? cents(0);
+  const contribution = d.contributionBalance.get(partyId) ?? cents(0);
+  return { account, contribution, total: cents(account + contribution), savings: d.savingsByParty.get(partyId) ?? cents(0) };
+}
+
 export function monthlyMail(state: State, party: Party, month: LocalDate) {
   const start = firstOfMonth(month);
   const end = addMonths(start, 1);
-  const rows = statementLines(state, party.id);
-  const opening = rows.filter((r) => r.date < start).at(-1)?.balance ?? cents(0);
-  const inMonth = rows.filter((r) => r.date >= start && r.date < end);
-  const closing = rows.filter((r) => r.date < end).at(-1)?.balance ?? cents(0);
+  const section = (ledger: Ledger) => {
+    const rows = statementLines(state, party.id, ledger);
+    return {
+      opening: rows.filter((r) => r.date < start).at(-1)?.balance ?? cents(0),
+      inMonth: rows.filter((r) => r.date >= start && r.date < end),
+      closing: rows.filter((r) => r.date < end).at(-1)?.balance ?? cents(0),
+    };
+  };
+  const account = section("account");
+  const contribution = section("contribution");
+  const savings = section("savings");
+  const fmtRow = (r: { date: LocalDate; description: string; activity: string | null; amount: number }) =>
+    `  ${formatDateNl(r.date)}  ${r.description}${r.activity ? ` (${r.activity})` : ""}: ${r.amount > 0 ? "+" : "-"}${formatEuro(cents(Math.abs(r.amount)))}`;
+  const total = cents(Math.max(0, account.closing) + Math.max(0, contribution.closing));
   const lines = [
     `Hoi ${party.member?.firstName ?? party.name},`,
     "",
     `Hierbij je overzicht van ${state.settings.name} over ${formatMonthNl(start)}.`,
     "",
-    `Beginsaldo: ${formatEuro(opening)}`,
-    ...inMonth.map((r) => `${formatDateNl(r.date)}  ${r.description}${r.activity ? ` (${r.activity})` : ""}: ${r.amount > 0 ? "+" : "-"}${formatEuro(cents(Math.abs(r.amount)))}`),
-    `Eindsaldo: ${formatEuro(closing)}`,
+    `REKENING (borrels, activiteiten, declaraties)`,
+    `  Begin: ${formatEuro(account.opening)}`,
+    ...account.inMonth.map(fmtRow),
+    `  Eind: ${formatEuro(account.closing)}${account.closing < 0 ? " (tegoed)" : ""}`,
+  ];
+  if (party.member) {
+    lines.push("", "CONTRIBUTIE", ...contribution.inMonth.map(fmtRow), `  Nog te betalen: ${formatEuro(cents(Math.max(0, contribution.closing)))}${contribution.closing < 0 ? ` (je hebt ${formatEuro(cents(-contribution.closing))} vooruitbetaald)` : ""}`);
+    if (savings.closing !== 0 || savings.inMonth.length) {
+      lines.push("", "SPAARPLAN", ...savings.inMonth.map(fmtRow), `  Gespaard: ${formatEuro(savings.closing)}`);
+    }
+  }
+  lines.push(
     "",
-    closing > 0
-      ? `Wil je ${formatEuro(closing)} overmaken naar ${formatIban(state.settings.paymentIban)} t.n.v. ${state.settings.paymentAccountName}, o.v.v. je naam? Dank je!`
-      : closing < 0
-        ? `Je hebt een tegoed van ${formatEuro(cents(-closing))}. Dat verrekenen we met je volgende kosten.`
-        : "Je staat precies op nul. Top!",
+    total > 0
+      ? `Wil je ${formatEuro(total)} overmaken naar ${formatIban(state.settings.paymentIban)} t.n.v. ${state.settings.paymentAccountName}, o.v.v. je naam${contribution.closing > 0 && account.closing > 0 ? ` (${formatEuro(contribution.closing)} contributie + ${formatEuro(account.closing)} rekening)` : contribution.closing > 0 ? " en \"contributie\"" : ""}? Dank je!`
+      : "Je hoeft deze maand niets over te maken. Top!",
     "",
     "Groet,",
     "De fiscus",
-  ];
-  return { subject: `${state.settings.name}: je overzicht ${formatMonthNl(start)}`, body: lines.join("\n"), closing, count: inMonth.length };
+  );
+  return { subject: `${state.settings.name}: je overzicht ${formatMonthNl(start)}`, body: lines.join("\n"), closing: total, count: account.inMonth.length + contribution.inMonth.length };
 }
 
 export function DebtorsPage() {
   const { state, d } = useLedger();
   const [showAll, setShowAll] = useState(false);
   const [month, setMonth] = useState(firstOfMonth(addMonths(today(), -1)).slice(0, 7));
+  const [kind, setKind] = useState<"all" | "member" | "external">("all");
   const persons = state.parties
-    .map((p) => ({ p, balance: d.partyBalance.get(p.id) ?? cents(0) }))
-    .filter((x) => showAll || x.balance !== 0)
+    .map((p) => ({ p, ...owedBy(d, p.id), balance: owedBy(d, p.id).total }))
+    .filter((x) => kind === "all" || x.p.kind === kind)
+    .filter((x) => showAll || x.balance !== 0 || x.account !== 0)
     .sort((a, b) => b.balance - a.balance);
   const openActs = state.activities.filter((a) => a.status === "open");
   const booksUpToDate = d.unassigned.length === 0;
-  const withMail = state.parties.filter((p) => p.email && (d.partyBalance.get(p.id) ?? 0) !== 0);
+  const withMail = state.parties.filter((p) => p.email && owedBy(d, p.id).total !== 0);
 
   const exportCsv = () => {
-    const lines = [csvLine(["Naam", "Soort", "Saldo (positief = moet betalen)"]), ...persons.map(({ p, balance }) => csvLine([p.name, p.kind === "member" ? "Lid" : "Extern", (balance / 100).toFixed(2).replace(".", ",")]))];
+    const eur = (v: number) => (v / 100).toFixed(2).replace(".", ",");
+    const lines = [csvLine(["Naam", "Soort", "Rekening", "Contributie", "Totaal te betalen (negatief = tegoed)", "Spaargeld"]), ...persons.map((x) => csvLine([x.p.name, x.p.kind === "member" ? "Lid" : "Extern", eur(x.account), eur(x.contribution), eur(x.balance), eur(x.savings)]))];
     download(`debiteurenlijst-${today()}.csv`, "﻿" + lines.join("\r\n"));
   };
 
@@ -174,19 +217,24 @@ export function DebtorsPage() {
       </Card>
 
       <Card>
-        <CardHeader className="flex-row items-center justify-between">
+        <CardHeader className="flex-row flex-wrap items-center justify-between gap-2">
           <CardTitle>Personen</CardTitle>
-          <label className="flex items-center gap-2 text-sm print:hidden"><input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} /> Ook saldo € 0</label>
+          <div className="flex flex-wrap items-center gap-2 print:hidden">
+            {(["all", "member", "external"] as const).map((k) => <Button key={k} size="sm" variant={kind === k ? "default" : "outline"} onClick={() => setKind(k)}>{k === "all" ? "Iedereen" : k === "member" ? "Leden" : "Externen"}</Button>)}
+            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} /> Ook € 0</label>
+          </div>
         </CardHeader>
         <CardContent className="p-0">
           <Table>
-            <TableHeader><TableRow><TableHead>Naam</TableHead><TableHead>Soort</TableHead><TableHead className="text-right">Saldo</TableHead><TableHead className="print:hidden" /></TableRow></TableHeader>
+            <TableHeader><TableRow><TableHead>Naam</TableHead><TableHead className="text-right">Rekening</TableHead><TableHead className="text-right">Contributie</TableHead><TableHead className="text-right">Totaal te betalen</TableHead><TableHead className="text-right">Spaargeld</TableHead><TableHead className="print:hidden" /></TableRow></TableHeader>
             <TableBody>
-              {persons.map(({ p, balance }) => (
+              {persons.map(({ p, balance, account, contribution, savings }) => (
                 <TableRow key={p.id}>
-                  <TableCell><A to={`persoon/${p.id}`}>{p.name}</A></TableCell>
-                  <TableCell><Badge variant={p.kind === "member" ? "secondary" : "outline"}>{p.kind === "member" ? "Lid" : "Extern"}</Badge></TableCell>
-                  <TableCell className="text-right"><Money value={balance} tone /><span className="ml-2 text-xs text-muted-foreground">{balance > 0 ? "moet betalen" : balance < 0 ? "tegoed" : ""}</span></TableCell>
+                  <TableCell><A to={`persoon/${p.id}`}>{p.name}</A>{p.kind === "external" && <Badge variant="outline" className="ml-2">extern</Badge>}</TableCell>
+                  <TableCell className="text-right"><Money value={account} tone /></TableCell>
+                  <TableCell className="text-right">{p.kind === "member" ? <Money value={contribution} tone /> : ""}</TableCell>
+                  <TableCell className="text-right font-medium"><Money value={balance} tone /><span className="ml-2 text-xs text-muted-foreground">{balance > 0 ? "moet betalen" : balance < 0 ? "tegoed" : ""}</span></TableCell>
+                  <TableCell className="text-right text-muted-foreground">{savings !== 0 && <Money value={savings} />}</TableCell>
                   <TableCell className="text-right print:hidden">
                     <Button variant="ghost" size="sm" onClick={() => go(`persoon/${p.id}?maand=${month}`)}>Overzicht</Button>
                   </TableCell>
@@ -195,8 +243,11 @@ export function DebtorsPage() {
             </TableBody>
             <TableFooter>
               <TableRow>
-                <TableCell colSpan={2}>Totaal te ontvangen / tegoeden</TableCell>
-                <TableCell className="text-right"><Money value={sum(persons.filter((x) => x.balance > 0).map((x) => x.balance))} /> / <Money value={-sum(persons.filter((x) => x.balance < 0).map((x) => x.balance))} /></TableCell>
+                <TableCell>Totaal</TableCell>
+                <TableCell className="text-right"><Money value={sum(persons.map((x) => x.account))} /></TableCell>
+                <TableCell className="text-right"><Money value={sum(persons.map((x) => x.contribution))} /></TableCell>
+                <TableCell className="text-right"><Money value={sum(persons.filter((x) => x.balance > 0).map((x) => x.balance))} /> te ontvangen</TableCell>
+                <TableCell className="text-right"><Money value={sum(persons.map((x) => x.savings))} /></TableCell>
                 <TableCell className="print:hidden" />
               </TableRow>
             </TableFooter>
@@ -212,7 +263,7 @@ export function DebtorsPage() {
               <TableBody>
                 {openActs.map((a) => (
                   <TableRow key={a.id}>
-                    <TableCell><A to={`activiteit/${a.id}`}>{a.name}</A></TableCell>
+                    <TableCell><A to={`activiteit/${a.id}`}><span className="font-mono text-xs text-muted-foreground">{a.number}</span> {a.name}</A></TableCell>
                     <TableCell>{a.heldOn ? formatDateNl(a.heldOn) : "—"}</TableCell>
                     <TableCell className="text-right"><Money value={d.activityBalance.get(a.id) ?? 0} /></TableCell>
                   </TableRow>
@@ -226,13 +277,13 @@ export function DebtorsPage() {
   );
 }
 
-export function StatementTable({ partyId }: { partyId: string }) {
+export function StatementTable({ partyId, ledger = "account" }: { partyId: string; ledger?: Ledger }) {
   const { state } = useLedger();
-  const rows = statementLines(state, partyId);
+  const rows = statementLines(state, partyId, ledger);
   if (!rows.length) return <Empty>Nog geen mutaties.</Empty>;
   return (
     <Table>
-      <TableHeader><TableRow><TableHead>Datum</TableHead><TableHead>Omschrijving</TableHead><TableHead className="text-right">Voorgeschoten</TableHead><TableHead className="text-right">Betaald / tegoed</TableHead><TableHead className="text-right">Saldo</TableHead></TableRow></TableHeader>
+      <TableHeader><TableRow><TableHead>Datum</TableHead><TableHead>Omschrijving</TableHead><TableHead className="text-right">{ledger === "savings" ? "Ingelegd" : ledger === "contribution" ? "Opgelegd" : "Voorgeschoten"}</TableHead><TableHead className="text-right">{ledger === "savings" ? "Gebruikt / uitbetaald" : "Betaald / tegoed"}</TableHead><TableHead className="text-right">{ledger === "savings" ? "Gespaard" : "Saldo"}</TableHead></TableRow></TableHeader>
       <TableBody>
         {[...rows].reverse().map((r) => (
           <TableRow key={r.id}>
@@ -240,7 +291,7 @@ export function StatementTable({ partyId }: { partyId: string }) {
             <TableCell>{r.description}{r.activity && <span className="text-muted-foreground"> · {r.activity}</span>}{r.reversal && <Badge variant="warning" className="ml-2">correctie</Badge>}</TableCell>
             <TableCell className="text-right">{r.amount > 0 && <Money value={r.amount} />}</TableCell>
             <TableCell className="text-right">{r.amount < 0 && <Money value={-r.amount} />}</TableCell>
-            <TableCell className="text-right font-medium"><Money value={r.balance} tone /></TableCell>
+            <TableCell className="text-right font-medium"><Money value={r.balance} tone={ledger !== "savings"} /></TableCell>
           </TableRow>
         ))}
       </TableBody>
@@ -248,8 +299,17 @@ export function StatementTable({ partyId }: { partyId: string }) {
   );
 }
 
-export function BalanceText({ balance }: { balance: Cents }) {
+export function BalanceText({ balance, contribution = cents(0) }: { balance: Cents; contribution?: Cents }) {
   const { state } = useLedger();
+  const total = cents(Math.max(0, balance) + Math.max(0, contribution));
+  if (contribution !== 0) {
+    return (
+      <div className="flex flex-col gap-1">
+        <p>Rekening: <Money value={balance} tone /> · Contributie: <Money value={contribution} tone /></p>
+        {total > 0 ? <p>Maak <strong className="text-red-700 dark:text-red-400">{formatEuro(total)}</strong> over naar <strong>{formatIban(state.settings.paymentIban)}</strong> t.n.v. {state.settings.paymentAccountName}, o.v.v. je naam.</p> : <p>Je hoeft niets over te maken.</p>}
+      </div>
+    );
+  }
   if (balance > 0) return <p>Openstaand: <strong className="text-red-700 dark:text-red-400">{formatEuro(balance)}</strong>. Maak dit over naar <strong>{formatIban(state.settings.paymentIban)}</strong> t.n.v. {state.settings.paymentAccountName}, o.v.v. je naam.</p>;
   if (balance < 0) return <p>Tegoed: <strong className="text-emerald-700 dark:text-emerald-400">{formatEuro(cents(-balance))}</strong>.</p>;
   return <p>Precies op nul.</p>;
@@ -262,7 +322,9 @@ export function PersonPage({ id, monthParam }: { id: string; monthParam?: string
   const [month, setMonth] = useState(monthParam ?? firstOfMonth(addMonths(today(), -1)).slice(0, 7));
   const mail = useMemo(() => (party ? monthlyMail(state, party, localDate(`${month}-01`)) : null), [state, party, month]);
   if (!party || !mail) return <Empty>Persoon niet gevonden.</Empty>;
-  const balance = d.partyBalance.get(party.id) ?? cents(0);
+  const owed = owedBy(d, party.id);
+  const balance = owed.total;
+  const goals = state.savingsGoals.filter((g) => (d.savings.get(`${party.id}|${g.id}`) ?? 0) !== 0);
   return (
     <div className="flex flex-col gap-6">
       <PageHeader title={party.name} description={party.kind === "member" ? `Lid · ${state.memberTypes.find((t) => t.id === party.member?.memberTypeId)?.name ?? ""}` : "Extern"}>
@@ -282,10 +344,27 @@ export function PersonPage({ id, monthParam }: { id: string; monthParam?: string
           <pre className="whitespace-pre-wrap rounded-md border bg-muted/40 p-3 font-sans text-sm">{mail.body}</pre>
         </CardContent>
       </Card>
+      <div className="grid gap-4 sm:grid-cols-3">
+        <Card><CardHeader><CardDescription>Rekening</CardDescription><CardTitle className="text-xl"><Money value={owed.account} tone /></CardTitle></CardHeader></Card>
+        {party.member && <Card><CardHeader><CardDescription>Contributie open</CardDescription><CardTitle className="text-xl"><Money value={owed.contribution} tone /></CardTitle></CardHeader></Card>}
+        {party.member && <Card><CardHeader><CardDescription>Spaargeld</CardDescription><CardTitle className="text-xl"><Money value={owed.savings} /></CardTitle><CardDescription className="text-xs">{goals.map((g) => `${g.name}: ${formatEuro(d.savings.get(`${party.id}|${g.id}`) ?? cents(0))}`).join(" · ")}</CardDescription></CardHeader></Card>}
+      </div>
       <Card>
-        <CardHeader><CardTitle>Rekening</CardTitle></CardHeader>
+        <CardHeader><CardTitle>Rekening</CardTitle><CardDescription>Borrels, activiteiten, declaraties en betalingen.</CardDescription></CardHeader>
         <CardContent className="p-0"><StatementTable partyId={party.id} /></CardContent>
       </Card>
+      {party.member && (
+        <Card>
+          <CardHeader><CardTitle>Contributie</CardTitle></CardHeader>
+          <CardContent className="p-0"><StatementTable partyId={party.id} ledger="contribution" /></CardContent>
+        </Card>
+      )}
+      {party.member && owed.savings !== 0 && (
+        <Card>
+          <CardHeader><CardTitle>Spaarplan</CardTitle></CardHeader>
+          <CardContent className="p-0"><StatementTable partyId={party.id} ledger="savings" /></CardContent>
+        </Card>
+      )}
     </div>
   );
 }
@@ -301,7 +380,6 @@ export function MembersPage() {
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const members = state.parties.filter((p) => p.member).sort((a, b) => (b.member!.cohort ?? 0) - (a.member!.cohort ?? 0) || a.name.localeCompare(b.name));
-  const externals = state.parties.filter((p) => p.kind === "external");
   return (
     <div className="flex flex-col gap-6">
       <PageHeader title="Leden" description={`${members.filter((m) => m.active).length} actieve leden`}>
@@ -328,7 +406,7 @@ export function MembersPage() {
                     <TableCell>{m.member!.cohort ?? "—"}</TableCell>
                     <TableCell><Badge variant="secondary">{type?.name}</Badge></TableCell>
                     <TableCell className="text-right"><Money value={type?.monthly ?? 0} /></TableCell>
-                    <TableCell className="text-right"><Money value={d.partyBalance.get(m.id) ?? 0} tone /></TableCell>
+                    <TableCell className="text-right"><Money value={owedBy(d, m.id).total} tone /></TableCell>
                     <TableCell className="text-right">{canEdit && <Button variant="ghost" size="sm" onClick={() => setEditing(m.id)}>Wijzigen</Button>}</TableCell>
                   </TableRow>
                 );
@@ -351,20 +429,8 @@ export function MembersPage() {
           </CardContent>
         </Card>
         <Card>
-          <CardHeader><CardTitle>Externen</CardTitle><CardDescription>Andere disputen, sponsoren, leveranciers. Ook zij hebben een eigen rekening.</CardDescription></CardHeader>
-          <CardContent className="flex flex-col gap-3">
-            <Table>
-              <TableBody>
-                {externals.map((x) => (
-                  <TableRow key={x.id}>
-                    <TableCell><A to={`persoon/${x.id}`}>{x.name}</A><div className="text-xs text-muted-foreground">{x.ibans.map(formatIban).join(", ")}</div></TableCell>
-                    <TableCell className="text-right"><Money value={d.partyBalance.get(x.id) ?? 0} tone /></TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-            {canEdit && <NewExternal />}
-          </CardContent>
+          <CardHeader><CardTitle>Externen</CardTitle><CardDescription>Andere disputen, sponsoren, leveranciers en gasten staan op een eigen pagina.</CardDescription></CardHeader>
+          <CardContent><A to="externen" className="text-sm font-medium">Naar Externen →</A></CardContent>
         </Card>
       </div>
     </div>
@@ -460,74 +526,6 @@ function NewMemberType() {
   );
 }
 
-function NewExternal() {
-  const { store, actor } = useApp();
-  const run = useAction();
-  const [name, setName] = useState("");
-  const [iban, setIban] = useState("");
-  return (
-    <div className="flex gap-2">
-      <Input placeholder="Naam, bijv. Dispuut Bacchus" value={name} onChange={(e) => setName(e.target.value)} />
-      <Input placeholder="IBAN (optioneel)" value={iban} onChange={(e) => setIban(e.target.value)} />
-      <Button onClick={() => run(() => { store.createExternal({ name, ibans: iban ? [iban] : [] }, actor); setName(""); setIban(""); }, "Toegevoegd")}>Toevoegen</Button>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Contribution
-// ---------------------------------------------------------------------------
-
-export function ContributionPage() {
-  const { store, actor } = useApp();
-  const { state } = useLedger();
-  const canEdit = useCan("edit");
-  const run = useAction();
-  const fy = currentFiscalYear(state, today());
-  const [month, setMonth] = useState(firstOfMonth(today()).slice(0, 7));
-  const months: LocalDate[] = [];
-  if (fy) for (let m = fy.startDate; m <= fy.endDate && m <= today(); m = addMonths(m, 1)) months.push(m);
-  return (
-    <div className="flex flex-col gap-6">
-      <PageHeader title="Contributie" description="Per maand, per soort lid. Op de 1e van de maand komt het bedrag op ieders rekening. Twee keer boeken kan niet." />
-      <ReadOnlyNotice />
-      {canEdit && (
-        <Card>
-          <CardContent className="flex flex-wrap items-end gap-3 p-5">
-            <Field label="Maand"><Input type="month" value={month} onChange={(e) => setMonth(e.target.value)} className="w-44" /></Field>
-            <Button onClick={() => run(() => {
-              const n = store.chargeContributions(localDate(`${month}-01`), actor);
-              if (n === 0) throw new Error("Voor deze maand is de contributie al geboekt (of er zijn geen betalende leden)");
-              return n;
-            }, "Contributie geboekt")}>Contributie boeken</Button>
-            <span className="pb-2 text-sm text-muted-foreground">In de echte versie gebeurt dit automatisch op de 1e.</span>
-          </CardContent>
-        </Card>
-      )}
-      <Card>
-        <CardHeader><CardTitle>Dit boekjaar</CardTitle></CardHeader>
-        <CardContent className="p-0">
-          <Table>
-            <TableHeader><TableRow><TableHead>Maand</TableHead><TableHead className="text-right">Leden</TableHead><TableHead className="text-right">Totaal</TableHead></TableRow></TableHeader>
-            <TableBody>
-              {months.reverse().map((m) => {
-                const rows = state.contributionMonths.filter((c) => c.month === m);
-                const total = sum(rows.map((r) => state.entries.find((e) => e.id === r.entryId)!.lines[0].amount));
-                return (
-                  <TableRow key={m}>
-                    <TableCell>{formatMonthNl(m)}</TableCell>
-                    <TableCell className="text-right">{rows.length || <Badge variant="warning">nog niet geboekt</Badge>}</TableCell>
-                    <TableCell className="text-right">{rows.length > 0 && <Money value={total} />}</TableCell>
-                  </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
 
 export function useLineTarget() {
   const { state, d } = useLedger();

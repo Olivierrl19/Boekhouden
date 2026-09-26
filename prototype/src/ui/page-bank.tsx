@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from "react";
-import { Upload, Download, Coins, Undo2, Check, Sparkles, Plus, Trash2 } from "lucide-react";
+import { Upload, Download, Coins, Undo2, Check, Sparkles, Plus, Trash2, UserPlus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -11,14 +11,14 @@ import { payerIban } from "@/domain/bank/suggestions";
 import { formatIban } from "@/domain/bank/iban";
 import { formatDateNl, localDate } from "@/domain/dates";
 import { cents, formatEuro, sum, type Cents } from "@/domain/money";
-import type { BankTx, ImportResult } from "../ledger";
+import type { AssignPart, BankTx, ImportResult } from "../ledger";
 import { nextDemoCsv } from "../demo";
 import { today } from "../ledger";
 import { Empty, Field, PageHeader, ReadOnlyNotice, Select, download, parseAmount, useAction, useApp, useCan, useLedger } from "./core";
 import { whereBooked } from "./labels";
 
-type Kind = "person" | "activity" | "pot" | "internal";
-interface Part { kind: Kind; id: string; amount: string }
+type Kind = AssignPart["kind"];
+interface Part { kind: Kind; id: string; goalId?: string; donorId?: string; amount: string }
 
 export function BankPage() {
   const { store, actor } = useApp();
@@ -30,6 +30,7 @@ export function BankPage() {
   const [result, setResult] = useState<(ImportResult & { file: string }) | null>(null);
   const [tab, setTab] = useState<"open" | "all">("open");
   const [showCash, setShowCash] = useState(false);
+  const [showManual, setShowManual] = useState(false);
 
   const unassigned = useMemo(() => [...d.unassigned].sort((a, b) => (a.bookingDate < b.bookingDate ? -1 : 1)), [d]);
   const current = unassigned.find((t) => t.id === selected) ?? unassigned[0] ?? null;
@@ -51,6 +52,7 @@ export function BankPage() {
           <>
             <input ref={fileRef} type="file" accept=".csv,text/csv" className="hidden" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
             <Button onClick={() => fileRef.current?.click()}><Upload /> Rabobank-CSV importeren</Button>
+            <Button variant="outline" onClick={() => setShowManual((v) => !v)}><Plus /> Transactie met de hand</Button>
             <Button variant="outline" onClick={() => setShowCash((v) => !v)}><Coins /> Kasmutatie</Button>
           </>
         )}
@@ -82,6 +84,7 @@ export function BankPage() {
       )}
 
       {showCash && <CashForm onDone={() => setShowCash(false)} />}
+      {showManual && <ManualForm onDone={() => setShowManual(false)} />}
 
       <div className="mb-4 flex gap-2">
         <Button variant={tab === "open" ? "default" : "outline"} size="sm" onClick={() => setTab("open")}>Nog toe te wijzen ({unassigned.length})</Button>
@@ -155,19 +158,68 @@ function CashForm({ onDone }: { onDone: () => void }) {
   );
 }
 
+function ManualForm({ onDone }: { onDone: () => void }) {
+  const { store, actor } = useApp();
+  const { state } = useLedger();
+  const run = useAction();
+  const banks = state.bankAccounts.filter((b) => b.kind !== "cash");
+  const [f, setF] = useState({ bankAccountId: banks[0]?.id ?? "", date: today() as string, dir: "in", amount: "", name: "", iban: "", description: "" });
+  const set = (k: keyof typeof f) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => setF({ ...f, [k]: e.target.value });
+  return (
+    <Card className="mb-4">
+      <CardHeader>
+        <CardTitle>Banktransactie met de hand toevoegen</CardTitle>
+        <CardDescription>Voor als je (nog) geen bankbestand hebt. Importeer je later de export, dan herkent de app deze transactie (zelfde bedrag, hooguit 3 dagen verschil) en boekt hij hem niet dubbel.</CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-3 sm:grid-cols-4 sm:items-end">
+        <Field label="Rekening"><Select value={f.bankAccountId} onChange={set("bankAccountId")}>{banks.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}</Select></Field>
+        <Field label="Datum"><Input type="date" value={f.date} onChange={set("date")} /></Field>
+        <Field label="Bij/af"><Select value={f.dir} onChange={set("dir")}><option value="in">Bij (ontvangen)</option><option value="out">Af (betaald)</option></Select></Field>
+        <Field label="Bedrag"><Input value={f.amount} onChange={set("amount")} placeholder="15,00" inputMode="decimal" /></Field>
+        <Field label="Tegenpartij"><Input value={f.name} onChange={set("name")} placeholder="Naam" /></Field>
+        <Field label="IBAN tegenpartij (optioneel)"><Input value={f.iban} onChange={set("iban")} placeholder="NL.." /></Field>
+        <Field label="Omschrijving"><Input value={f.description} onChange={set("description")} /></Field>
+        <Button onClick={() => run(() => {
+          const a = Math.abs(parseAmount(f.amount));
+          store.addManualBankTransaction({ bankAccountId: f.bankAccountId, date: localDate(f.date), amount: cents(f.dir === "in" ? a : -a), counterpartyName: f.name, counterpartyIban: f.iban || null, description: f.description }, actor);
+          onDone();
+        }, "Transactie toegevoegd; wijs hem nu toe")}>Toevoegen</Button>
+      </CardContent>
+    </Card>
+  );
+}
+
 function TargetSelect({ part, onChange, incoming }: { part: Part; onChange: (p: Part) => void; incoming: boolean }) {
   const { state } = useLedger();
   const members = state.parties.filter((p) => p.kind === "member").sort((a, b) => a.name.localeCompare(b.name));
   const externals = state.parties.filter((p) => p.kind === "external").sort((a, b) => a.name.localeCompare(b.name));
   const openActs = state.activities.filter((a) => a.status === "open");
+  const goals = state.savingsGoals.filter((g) => g.active);
+  const personId = part.kind === "person" || part.kind === "contribution" || part.kind === "savings" ? part.id : "";
   return (
-    <div className="grid gap-2 sm:grid-cols-[10rem_1fr]">
-      <Select value={part.kind} onChange={(e) => onChange({ ...part, kind: e.target.value as Kind, id: "" })}>
-        <option value="person">Persoon</option>
+    <div className="grid gap-2 sm:grid-cols-[13rem_1fr]">
+      <Select value={part.kind} onChange={(e) => onChange({ ...part, kind: e.target.value as Kind, id: ["person", "contribution", "savings"].includes(e.target.value) ? personId : "", goalId: goals[0]?.id })}>
+        <option value="contribution">Contributie van lid</option>
+        <option value="person">Rekening van persoon</option>
+        <option value="savings">Spaarplan van lid</option>
         <option value="activity">Activiteit</option>
-        <option value="pot">Potje</option>
+        <option value="pot">Potje / donatie</option>
         <option value="internal">Interne overboeking</option>
       </Select>
+      {(part.kind === "contribution" || part.kind === "savings") && (
+        <div className="grid gap-2 sm:grid-cols-2">
+          <Select value={part.id} onChange={(e) => onChange({ ...part, id: e.target.value })}>
+            <option value="">Kies een lid…</option>
+            {members.map((p) => <option key={p.id} value={p.id}>{p.name}{p.active ? "" : " (uitgeschreven)"}</option>)}
+          </Select>
+          {part.kind === "savings" && (
+            <Select value={part.goalId ?? ""} onChange={(e) => onChange({ ...part, goalId: e.target.value })}>
+              {goals.length === 0 && <option value="">Maak eerst een spaardoel aan</option>}
+              {goals.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+            </Select>
+          )}
+        </div>
+      )}
       {part.kind === "person" && (
         <Select value={part.id} onChange={(e) => onChange({ ...part, id: e.target.value })}>
           <option value="">Kies een persoon…</option>
@@ -178,14 +230,22 @@ function TargetSelect({ part, onChange, incoming }: { part: Part; onChange: (p: 
       {part.kind === "activity" && (
         <Select value={part.id} onChange={(e) => onChange({ ...part, id: e.target.value })}>
           <option value="">Kies een activiteit…</option>
-          {openActs.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+          {openActs.map((a) => <option key={a.id} value={a.id}>{a.number} · {a.name}</option>)}
         </Select>
       )}
       {part.kind === "pot" && (
-        <Select value={part.id} onChange={(e) => onChange({ ...part, id: e.target.value })}>
-          <option value="">Kies een potje…</option>
-          {state.pots.map((p) => <option key={p.id} value={p.id}>{p.name} ({incoming ? "opbrengst" : "kosten"})</option>)}
-        </Select>
+        <div className="grid gap-2 sm:grid-cols-2">
+          <Select value={part.id} onChange={(e) => onChange({ ...part, id: e.target.value })}>
+            <option value="">Kies een potje…</option>
+            {state.pots.map((p) => <option key={p.id} value={p.id}>{p.name} ({incoming ? "opbrengst" : "kosten"})</option>)}
+          </Select>
+          {incoming && (
+            <Select value={part.donorId ?? ""} onChange={(e) => onChange({ ...part, donorId: e.target.value })} title="Van wie (bijv. bij een donatie)">
+              <option value="">Van wie? (optioneel)</option>
+              {[...members, ...externals].map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </Select>
+          )}
+        </div>
       )}
       {part.kind === "internal" && <div className="self-center text-sm text-muted-foreground">Naar/van een eigen rekening</div>}
     </div>
@@ -199,13 +259,7 @@ function AssignPanel({ tx }: { tx: BankTx }) {
   const run = useAction();
   const suggestions = useMemo(() => store.suggestions(tx.id), [store, tx.id, state]); // eslint-disable-line react-hooks/exhaustive-deps
   const incoming = tx.amount > 0;
-  const initial: Part = suggestions[0]
-    ? {
-        kind: suggestions[0].target.kind,
-        id: "partyId" in suggestions[0].target ? suggestions[0].target.partyId : "activityId" in suggestions[0].target ? suggestions[0].target.activityId : "potId" in suggestions[0].target ? suggestions[0].target.potId : "",
-        amount: "",
-      }
-    : { kind: incoming ? "person" : "pot", id: "", amount: "" };
+  const initial: Part = suggestions[0] ? { ...targetToPart(suggestions[0].target), amount: "" } : { kind: incoming ? "contribution" : "pot", id: "", amount: "" };
   const [parts, setParts] = useState<Part[]>([initial]);
   const split = parts.length > 1;
   const ownIbans = state.bankAccounts.map((b) => b.iban).filter((x): x is string => !!x);
@@ -234,9 +288,9 @@ function AssignPanel({ tx }: { tx: BankTx }) {
       const amounts = partAmounts();
       store.assign(
         tx.id,
-        parts.map((p, i) => ({ kind: p.kind, id: p.id, amount: amounts[i] })),
+        parts.map((p, i) => ({ kind: p.kind, id: p.id, goalId: p.goalId, donorId: p.donorId || null, amount: amounts[i] })),
         actor,
-        { rememberIbanFor: !split && parts[0].kind === "person" && remember && payer && !payerKnown ? parts[0].id : null },
+        { rememberIbanFor: !split && ["person", "contribution", "savings"].includes(parts[0].kind) && remember && payer && !payerKnown ? parts[0].id : null },
       );
     }, "Geboekt");
 
@@ -259,9 +313,8 @@ function AssignPanel({ tx }: { tx: BankTx }) {
                 <span className="flex items-center gap-2"><Sparkles className="size-4 text-sky-600" />{sg.label}</span>
                 {canEdit && (
                   <Button size="sm" onClick={() => run(() => {
-                    const t = sg.target;
-                    const id = t.kind === "person" ? t.partyId : t.kind === "activity" ? t.activityId : t.kind === "pot" ? t.potId : "";
-                    store.assign(tx.id, [{ kind: t.kind, id, amount: tx.amount }], actor);
+                    const p = targetToPart(sg.target);
+                    store.assign(tx.id, [{ kind: p.kind, id: p.id, goalId: p.goalId, amount: tx.amount }], actor);
                   }, "Geboekt")}>Boek zo</Button>
                 )}
               </div>
@@ -293,13 +346,14 @@ function AssignPanel({ tx }: { tx: BankTx }) {
                 </span>
               )}
             </div>
-            {!split && parts[0].kind === "person" && payer && !payerKnown && (
+            {!split && ["person", "contribution", "savings"].includes(parts[0].kind) && parts[0].id && payer && !payerKnown && (
               <label className="flex items-center gap-2 text-sm">
                 <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
                 IBAN {formatIban(payer)} onthouden, zodat de app deze persoon volgende keer voorstelt
               </label>
             )}
             <Button onClick={book}>Boeken</Button>
+            {tx.counterpartyName && !payerKnown && <NewPersonFromTx tx={tx} onCreated={(id, kind) => setParts([{ kind: kind === "member" ? "contribution" : "person", id, amount: "" }])} />}
           </>
         ) : (
           <p className="text-sm text-muted-foreground">Alleen fiscus en bestuur kunnen toewijzen.</p>
@@ -354,7 +408,7 @@ function AllTransactions() {
                     <TableCell className="whitespace-nowrap">{formatDateNl(t.bookingDate)}</TableCell>
                     <TableCell className="text-right"><Money value={t.amount} /></TableCell>
                     <TableCell>
-                      <div className="max-w-64 truncate">{t.counterpartyName ?? "—"}</div>
+                      <div className="max-w-64 truncate">{t.counterpartyName ?? "—"}{t.manual && <Badge variant="outline" className="ml-2">{t.matchedExternalId ? "handmatig, bevestigd door bank" : "handmatig"}</Badge>}</div>
                       <div className="max-w-64 truncate text-xs text-muted-foreground">{t.description}</div>
                     </TableCell>
                     <TableCell>
@@ -379,5 +433,50 @@ function AllTransactions() {
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function targetToPart(t: import("@/domain/bank/suggestions").SuggestionTarget): Part {
+  switch (t.kind) {
+    case "person": return { kind: "person", id: t.partyId, amount: "" };
+    case "contribution": return { kind: "contribution", id: t.partyId, amount: "" };
+    case "savings": return { kind: "savings", id: t.partyId, goalId: t.goalId, amount: "" };
+    case "activity": return { kind: "activity", id: t.activityId, amount: "" };
+    case "pot": return { kind: "pot", id: t.potId, amount: "" };
+    case "internal": return { kind: "internal", id: "", amount: "" };
+  }
+}
+
+/** Unknown counterparty? Create a member or external straight from the bank line (with its IBAN). */
+function NewPersonFromTx({ tx, onCreated }: { tx: BankTx; onCreated: (id: string, kind: "member" | "external") => void }) {
+  const { store, actor } = useApp();
+  const { state } = useLedger();
+  const run = useAction();
+  const [open, setOpen] = useState(false);
+  const [kind, setKind] = useState<"external" | "member">("external");
+  const [name, setName] = useState(tx.counterpartyName ?? "");
+  const ownIbans = state.bankAccounts.map((b) => b.iban).filter((x): x is string => !!x);
+  const iban = payerIban(tx, ownIbans);
+  if (!open) return <Button variant="ghost" size="sm" className="self-start" onClick={() => setOpen(true)}><UserPlus /> Onbekend? Maak “{tx.counterpartyName}” aan als lid of externe</Button>;
+  return (
+    <div className="flex flex-col gap-2 rounded-md border p-3 text-sm">
+      <div className="grid gap-2 sm:grid-cols-[9rem_1fr]">
+        <Select value={kind} onChange={(e) => setKind(e.target.value as "external" | "member")}><option value="external">Externe</option><option value="member">Lid</option></Select>
+        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder={kind === "member" ? "Voornaam Achternaam" : "Naam"} />
+      </div>
+      {iban && <span className="text-xs text-muted-foreground">IBAN {formatIban(iban)} wordt onthouden.</span>}
+      <Button size="sm" className="self-start" onClick={() => run(() => {
+        let id: string;
+        if (kind === "external") id = store.createExternal({ name, ibans: iban ? [iban] : [] }, actor).id;
+        else {
+          const [first, ...rest] = name.trim().split(/\s+/);
+          const type = state.memberTypes.find((t) => t.active) ?? state.memberTypes[0];
+          if (!type) throw new Error("Maak eerst een soort lid aan (Leden)");
+          id = store.createMember({ firstName: first ?? "", lastName: rest.join(" ") || "-", memberTypeId: type.id, joinedOn: tx.bookingDate, ibans: iban ? [iban] : [] }, actor).id;
+        }
+        onCreated(id, kind);
+        setOpen(false);
+      }, "Aangemaakt; kies nu waar het geboekt wordt")}>Aanmaken</Button>
+    </div>
   );
 }

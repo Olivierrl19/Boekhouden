@@ -7,11 +7,13 @@ import { extractIbans, normalizeIban } from "./iban";
 export type SuggestionTarget =
   | { kind: "internal" }
   | { kind: "person"; partyId: string }
+  | { kind: "contribution"; partyId: string }
+  | { kind: "savings"; partyId: string; goalId: string }
   | { kind: "activity"; activityId: string }
   | { kind: "pot"; potId: string };
 
 export interface Suggestion {
-  reason: "internal" | "known_iban" | "iban_in_description" | "same_as_last";
+  reason: "internal" | "contribution" | "known_iban" | "iban_in_description" | "same_as_last";
   label: string; // Dutch, shown in the UI
   target: SuggestionTarget;
   autoBook: boolean;
@@ -56,7 +58,7 @@ export function suggestAssignment(
   }
   if (cp) {
     const last = ctx.lastByCounterparty.get(cp);
-    if (last && !(last.target.kind === "person" && seen.has(last.target.partyId))) {
+    if (last && !(last.target.kind === "person" && seen.has(last.target.partyId)) && !out.some((o) => JSON.stringify(o.target) === JSON.stringify(last.target))) {
       out.push({ reason: "same_as_last", label: `Zelfde als vorige keer: ${last.label}`, target: last.target, autoBook: false });
     }
   }

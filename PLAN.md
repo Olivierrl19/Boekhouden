@@ -659,3 +659,19 @@ Per boekjaar met vergelijking vorig jaar; PDF (@react-pdf/renderer) en Excel (ex
 | g | Activiteiten + verdelen/afrekenen met PDF; leden-, commissie- en bestuursafrekening |
 | h | Kasboek + kastelling, memoriaal-UI, bestemmingsreserves |
 | i | Rapportages, jaarafsluiting met checklist, kascommissie-pakket, ALV-jaarrekening, installatiewizard afgerond |
+
+## 15. Aanvullingen v3 (feedback op het prototype)
+
+| Onderwerp | Besluit |
+|---|---|
+| Contributie | Leden maken hun contributie **zelf maandelijks over**. De maandelijkse aanslag (T01) komt op een aparte **contributierekening per lid** (1305 *Contributie te ontvangen*), los van de rekening voor borrels/activiteiten (1300). Betalingen worden toegewezen als "Contributie van lid"; het overzicht verrekent betalingen met de oudste maand eerst (betaald / deels / open per maand). Bulk-toewijzen van contributiebetalingen. |
+| Verdeling contributie | Contributie is inkomsten (rekening 8000) die met een **verdeelsleutel** (gehele gewichten, bijv. procenten) over potjes wordt verdeeld bij het opleggen (largest remainder, exact tot op de cent). Wijzigen geldt voor volgende maanden. |
+| Spaarplannen | Leden sparen bij het dispuut per **spaardoel** (bijv. Lustrumreis 2028). Spaargeld is een schuld aan het lid: rekening 1740 *Spaartegoeden leden* met dimensie `savings_goal_id`. Inleg/uitbetaling via bank (T33); inzetten voor wat het lid moet betalen via T32 (1740 → 1300), per lid of voor iedereen tegelijk (nooit meer dan gespaard). Advies-maandbedrag toont of iemand op schema ligt. |
+| Donaties | Potje **Donaties** (8110). Bij toewijzen kan de gever worden vastgelegd (`related_party_id`, informatief, telt nooit mee in persoonssaldi); rapport "donaties per gever". |
+| Begroting | Begrotingsregels met eigen omschrijving per potje en soort (baten/lasten), meerdere regels per potje; kopiëren van vorig jaar (begroting of realisatie); verwachte contributie automatisch berekenen; eigen potjes toevoegen. |
+| Activiteiten | Vast **nummer per boekjaar** (`A26-001`), zoekbaar en bruikbaar als betaalomschrijving. |
+| Externen | Eigen pagina met saldo, betaalverzoektekst (Tikkie/WhatsApp/mail) en "bedrag erop zetten"; externe direct aanmaken vanuit een bankregel of tijdens het afrekenen. |
+| Handmatige banktransacties | Toe te voegen zonder bankbestand (`manual`). Een latere import koppelt een bankregel met hetzelfde bedrag en ≤ 3 dagen verschil aan de handmatige transactie in plaats van dubbel te boeken; een handmatige transactie die niet in het bankbestand staat blokkeert de import met uitleg. Saldocontrole: grootboek − nog onbevestigde handmatige transacties = laatste banksaldo. |
+| Voorstellen | Deterministisch uitgebreid: omschrijving met "contributie" → contributie; "spaar/sparen" → spaarplan; bedrag = open contributie of veelvoud van het maandtarief → contributie. Nooit automatisch geboekt. |
+
+Nieuwe templates: **T32** spaargeld verrekend (D 1740 party+doel · C 1300 party), **T33** inleg/uitbetaling spaarplan (1099 ↔ 1740). T01 debiteert nu 1305 en verdeelt de baten over potjes.

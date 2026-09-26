@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Money } from "@/components/money";
-import { cents } from "@/domain/money";
+import { cents, formatEuro } from "@/domain/money";
 import { formatDateNl, localDate } from "@/domain/dates";
 import { today, type Claim } from "../ledger";
 import { Empty, Field, PageHeader, ReadOnlyNotice, Select, parseAmount, useAction, useApp, useCan, useLedger } from "./core";
@@ -59,7 +59,7 @@ export function ClaimForm({ partyId: fixedParty }: { partyId?: string }) {
         <Field label="Waarvoor"><Input value={f.description} onChange={(e) => setF({ ...f, description: e.target.value })} placeholder="Chips en fris borrel" /></Field>
         <Field label="Voor activiteit of potje">
           <Select value={f.target} onChange={(e) => setF({ ...f, target: e.target.value })}>
-            <optgroup label="Activiteit (wordt verdeeld over deelnemers)">{openActs.map((a) => <option key={a.id} value={`activity:${a.id}`}>{a.name}</option>)}</optgroup>
+            <optgroup label="Activiteit (wordt verdeeld over deelnemers)">{openActs.map((a) => <option key={a.id} value={`activity:${a.id}`}>{a.number} · {a.name}</option>)}</optgroup>
             <optgroup label="Potje (kosten voor het dispuut)">{state.pots.map((p) => <option key={p.id} value={`pot:${p.id}`}>{p.name}</option>)}</optgroup>
           </Select>
         </Field>
@@ -153,10 +153,14 @@ export function MyPage() {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader title="Mijn rekening" description={party.name} />
-      <Card><CardContent className="p-5"><BalanceText balance={d.partyBalance.get(party.id) ?? cents(0)} /></CardContent></Card>
+      <Card><CardContent className="p-5"><BalanceText balance={d.partyBalance.get(party.id) ?? cents(0)} contribution={d.contributionBalance.get(party.id) ?? cents(0)} /></CardContent></Card>
       <ClaimForm partyId={party.id} />
       <Card><CardHeader><CardTitle>Mijn declaraties</CardTitle></CardHeader><CardContent className="p-0"><ClaimList claims={state.claims.filter((c) => c.partyId === party.id)} showParty={false} /></CardContent></Card>
-      <Card><CardHeader><CardTitle>Mutaties</CardTitle></CardHeader><CardContent className="p-0"><StatementTable partyId={party.id} /></CardContent></Card>
+      <Card><CardHeader><CardTitle>Rekening</CardTitle></CardHeader><CardContent className="p-0"><StatementTable partyId={party.id} /></CardContent></Card>
+      <Card><CardHeader><CardTitle>Contributie</CardTitle></CardHeader><CardContent className="p-0"><StatementTable partyId={party.id} ledger="contribution" /></CardContent></Card>
+      {(d.savingsByParty.get(party.id) ?? 0) !== 0 && (
+        <Card><CardHeader><CardTitle>Spaarplan: {formatEuro(d.savingsByParty.get(party.id) ?? cents(0))} gespaard</CardTitle></CardHeader><CardContent className="p-0"><StatementTable partyId={party.id} ledger="savings" /></CardContent></Card>
+      )}
     </div>
   );
 }

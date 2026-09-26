@@ -31,6 +31,7 @@ export const DEFAULT_ACCOUNTS: DefaultAccount[] = [
   { code: "1099", name: "Te verwerken bank- en kasmutaties", type: "asset", systemKey: "BANK_SUSPENSE", manualPostingAllowed: false },
   // Receivables
   { code: "1300", name: "Rekeningen leden", type: "asset", systemKey: "MEMBER_ACCOUNTS", partyKind: "member" },
+  { code: "1305", name: "Contributie te ontvangen", type: "asset", systemKey: "CONTRIBUTION_RECEIVABLE", partyKind: "member" },
   { code: "1310", name: "Rekeningen externen", type: "asset", systemKey: "EXTERNAL_ACCOUNTS", partyKind: "external" },
   { code: "1320", name: "Nog te ontvangen bedragen", type: "asset", systemKey: "ACCRUED_INCOME" },
   { code: "1350", name: "Nog te verdelen (activiteiten)", type: "asset", systemKey: "TO_DISTRIBUTE", requiresActivity: true },
@@ -39,10 +40,11 @@ export const DEFAULT_ACCOUNTS: DefaultAccount[] = [
   { code: "1600", name: "Crediteuren", type: "liability", systemKey: "ACCOUNTS_PAYABLE", partyKind: "external" },
   { code: "1700", name: "Nog te betalen kosten", type: "liability", systemKey: "ACCRUED_EXPENSES" },
   { code: "1730", name: "Vooruitontvangen bedragen", type: "liability", systemKey: "DEFERRED_INCOME" },
+  { code: "1740", name: "Spaartegoeden leden", type: "liability", systemKey: "MEMBER_SAVINGS", partyKind: "member" },
   // Income
   { code: "8000", name: "Contributie", type: "income", systemKey: "CONTRIBUTION" },
   { code: "8100", name: "Sponsoring", type: "income" },
-  { code: "8110", name: "Donaties en giften", type: "income" },
+  { code: "8110", name: "Donaties en giften", type: "income", systemKey: "DONATIONS" },
   { code: "8400", name: "Verhuur", type: "income" },
   { code: "8800", name: "Rente", type: "income" },
   { code: "8900", name: "Overige baten", type: "income" },
@@ -72,6 +74,7 @@ export interface DefaultPot {
 export const DEFAULT_POTS: DefaultPot[] = [
   { code: "CONTRIBUTIE", name: "Contributie", income: "8000", expense: "4990" },
   { code: "SPONSORING", name: "Sponsoring", income: "8100", expense: "4990" },
+  { code: "DONATIES", name: "Donaties", income: "8110", expense: "4990" },
   { code: "BORRELS", name: "Borrels", income: "8900", expense: "4000" },
   { code: "HUISVESTING", name: "Huisvesting", income: "8400", expense: "4100" },
   { code: "ACTIVITEITEN", name: "Activiteiten", income: "8900", expense: "4200" },

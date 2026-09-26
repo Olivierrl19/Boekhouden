@@ -22,14 +22,27 @@ Open op GitHub `docs/index.html`, klik op **Download raw file** (het pijltje) en
 Kies dan **Start voorbeelddispuut** om rond te kijken, of maak je eigen dispuut aan. Wissel linksonder
 van rol (fiscus, bestuur, kascommissie of een lid) om te zien wat iedereen ziet en mag.
 
-Wat werkt in het prototype: Rabobank-CSV importeren (dubbel importeren boekt niets dubbel, gaten in
-het saldo worden geweigerd), toewijzen ("waar geboekt") met voorstellen op bekend IBAN en Tikkie,
-splitsen, ongedaan maken, debiteurenlijst, maandmail per persoon (via je eigen mailprogramma),
-leden en soorten leden, maandcontributie, activiteiten met "nog te verdelen" en afrekenen (gelijk,
-streepjes, vast bedrag, dispuutsdeel), declaraties met foto van de bon, kasboek, rapportages
-(balans, resultaat per potje vs begroting, vorig jaar), journaal, bestemmingsreserves, memoriaal,
-boekjaar afsluiten met controlelijst, zelfcontrole en logboek met hash-keten, export naar Excel/CSV
-en afdrukken als PDF.
+Wat werkt in het prototype:
+
+- **Bank**: Rabobank-CSV importeren (dubbel importeren boekt niets dubbel, gaten in het saldo worden
+  geweigerd), transacties met de hand toevoegen (een latere import herkent ze), toewijzen ("waar
+  geboekt") met voorstellen op bekend IBAN, Tikkie en omschrijving, splitsen, ongedaan maken, en een
+  lid of externe direct aanmaken vanuit een bankregel.
+- **Contributie**: per maand opleggen per soort lid, zien wie welke maand betaald heeft, alle
+  contributiebetalingen in één keer toewijzen, en de contributie-inkomsten met een verdeelsleutel
+  over potjes verdelen.
+- **Spaarplannen** per lid en spaardoel (bijv. lustrumreis): inleggen via de bank, zien wie op schema
+  ligt, en spaargeld verrekenen met wat iemand moet betalen.
+- **Debiteurenlijst** met rekening, contributie, totaal en spaargeld per persoon; maandmail per
+  persoon (via je eigen mailprogramma).
+- **Activiteiten** met vast nummer (A26-001) en "nog te verdelen"; afrekenen gelijk, naar streepjes, met
+  vast bedrag (ook een nieuwe externe direct toevoegen) en dispuutsdeel.
+- **Externen** met saldo, betaalverzoektekst voor Tikkie/WhatsApp en bedragen op hun rekening zetten.
+- **Begroting** met eigen regels per potje, kopiëren van vorig jaar, verwachte contributie automatisch,
+  eigen potjes; **donaties** van oud-leden met overzicht per gever.
+- Declaraties met foto van de bon, kasboek, rapportages (balans, resultaat per potje vs begroting,
+  vorig jaar), journaal, bestemmingsreserves, memoriaal, boekjaar afsluiten met controlelijst,
+  zelfcontrole en logboek met hash-keten, export naar Excel/CSV en afdrukken als PDF.
 
 Prototype opnieuw bouwen na codewijzigingen: `npm run prototype`.
 

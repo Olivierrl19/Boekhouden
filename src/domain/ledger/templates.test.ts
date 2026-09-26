@@ -18,6 +18,7 @@ import {
   reserveDotation,
   reserveWithdrawal,
   salesInvoiceSent,
+  savingsSettled,
   validateDraft,
   writeOff,
   yearClose,
@@ -153,23 +154,65 @@ describe("assigning a bank transaction", () => {
 });
 
 describe("T01 contribution", () => {
-  it("charges the member and books income on the contribution pot", () => {
+  it("puts it on the member's contribution account and books income on the contribution pot", () => {
     const d = contributionCharged({
       chargeId: "c",
       partyId: "p",
       month: localDate("2026-09-01"),
       amount: cents(1500),
-      potId: "pot",
       incomeAccountId: "8000",
+      split: [{ potId: "pot", weight: 1 }],
       description: "Contributie september 2026",
     });
     expect(d.template).toBe("T01");
     expect(linesOf(d)).toEqual([
-      ["MEMBER_ACCOUNTS", 1500],
+      ["CONTRIBUTION_RECEIVABLE", 1500],
       ["id:8000", -1500],
     ]);
     expect(d.lines[0].partyId).toBe("p");
     expect(d.lines[1].potId).toBe("pot");
+  });
+
+  it("divides the income over pots with the key, exactly to the cent", () => {
+    const d = contributionCharged({
+      chargeId: "c",
+      partyId: "p",
+      month: localDate("2026-09-01"),
+      amount: cents(1000),
+      incomeAccountId: "8000",
+      split: [{ potId: "huis", weight: 1 }, { potId: "act", weight: 1 }, { potId: "res", weight: 1 }, { potId: "leeg", weight: 0 }],
+      description: "Contributie",
+    });
+    expect(d.lines.slice(1).map((l) => [l.potId, l.amount])).toEqual([["huis", -334], ["act", -333], ["res", -333]]);
+    expectBalanced(d);
+  });
+
+  it("refuses an empty key", () => {
+    expect(() => contributionCharged({ chargeId: "c", partyId: "p", month: localDate("2026-09-01"), amount: cents(1), incomeAccountId: "8000", split: [], description: "x" })).toThrow(/verdeelsleutel/);
+  });
+});
+
+describe("contribution payments, savings and donations", () => {
+  it("assigns a payment to the contribution account", () => {
+    const d = assignBankTransaction({ tx: tx(1500), targets: [{ kind: "contribution", partyId: "p", amount: cents(1500) }] });
+    expect(d.template).toBe("T02");
+    expect(linesOf(d)).toEqual([["BANK_SUSPENSE", 1500], ["CONTRIBUTION_RECEIVABLE", -1500]]);
+  });
+  it("assigns a savings deposit to the member's savings goal", () => {
+    const d = assignBankTransaction({ tx: tx(2000), targets: [{ kind: "savings", partyId: "p", goalId: "lustrum", amount: cents(2000) }] });
+    expect(d.template).toBe("T33");
+    expect(linesOf(d)).toEqual([["BANK_SUSPENSE", 2000], ["MEMBER_SAVINGS", -2000]]);
+    expect(d.lines[1].savingsGoalId).toBe("lustrum");
+  });
+  it("records the donor on a donation without making it a person balance", () => {
+    const d = assignBankTransaction({ tx: tx(5000), targets: [{ kind: "pot", potId: "don", accountId: "8110", amount: cents(5000), relatedPartyId: "oudlid" }] });
+    expect(d.lines[1]).toMatchObject({ potId: "don", relatedPartyId: "oudlid" });
+    expect(d.lines[1].partyId ?? null).toBeNull();
+  });
+  it("T32 moves savings to the member's account", () => {
+    const d = savingsSettled({ partyId: "p", goalId: "lustrum", goalName: "Lustrumreis", date: D, amount: cents(25000) });
+    expect(linesOf(d)).toEqual([["MEMBER_SAVINGS", 25000], ["MEMBER_ACCOUNTS", -25000]]);
+    expectBalanced(d);
   });
 });
 
@@ -571,7 +614,7 @@ describe("property: every template output balances", () => {
     fc.assert(
       fc.property(amount, (a: Cents) => {
         expectBalanced(
-          contributionCharged({ chargeId: "c", partyId: "p", month: localDate("2026-09-01"), amount: a, potId: "x", incomeAccountId: "8000", description: "c" }),
+          contributionCharged({ chargeId: "c", partyId: "p", month: localDate("2026-09-01"), amount: a, incomeAccountId: "8000", split: [{ potId: "x", weight: 3 }, { potId: "y", weight: 7 }], description: "c" }),
         );
         expectBalanced(
           expenseClaimApproved({ claimId: "c", partyId: "p", date: D, amount: a, target: { kind: "activity", activityId: "a" }, description: "d" }),

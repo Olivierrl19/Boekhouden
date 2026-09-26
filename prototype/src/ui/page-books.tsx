@@ -8,7 +8,7 @@ import { Table, TableBody, TableCell, TableFooter, TableHead, TableHeader, Table
 import { Money } from "@/components/money";
 import { cents, formatEuro, sum, type Cents } from "@/domain/money";
 import { formatDateNl } from "@/domain/dates";
-import { accountBalances, currentFiscalYear, resultByPot, today, type FiscalYear, type State } from "../ledger";
+import { accountBalances, currentFiscalYear, donationsByGiver, migrateState, resultByPot, today, type FiscalYear, type State } from "../ledger";
 import { Empty, Field, PageHeader, ReadOnlyNotice, Select, csvLine, download, parseAmount, useAction, useApp, useCan, useLedger } from "./core";
 import { TEMPLATE_LABEL, lineTarget } from "./labels";
 
@@ -71,7 +71,8 @@ export function ReportsPage() {
   const totalPassive = sum([...bs.liabilities, ...bs.equity].map((a) => cents(a.amount)));
   const res = resultByPot(state, fy);
   const resPrev = prev ? resultByPot(state, prev) : new Map();
-  const budget = (potId: string, kind: "income" | "expense") => state.budgets.find((b) => b.fiscalYearId === fy.id && b.potId === potId && b.kind === kind)?.amount ?? cents(0);
+  const budget = (potId: string, kind: "income" | "expense") => sum(state.budgets.filter((b) => b.fiscalYearId === fy.id && b.potId === potId && b.kind === kind).map((b) => b.amount));
+  const donations = donationsByGiver(state, fy);
   const rows = state.pots.map((p) => {
     const r = res.get(p.id) ?? { income: 0, expense: 0 };
     const rp = resPrev.get(p.id) ?? { income: 0, expense: 0 };
@@ -146,28 +147,19 @@ export function ReportsPage() {
           </Table>
         </CardContent>
       </Card>
-      {isAdmin && <BudgetEditor fy={fy} />}
+      {donations.length > 0 && (
+        <Card>
+          <CardHeader><CardTitle>Donaties {fy.label}</CardTitle><CardDescription>Wie gaf wat (voor een bedankje of het jaarverslag).</CardDescription></CardHeader>
+          <CardContent className="p-0">
+            <Table>
+              <TableBody>{donations.map((x) => <TableRow key={x.partyId ?? "anon"}><TableCell>{x.partyId ? state.parties.find((p) => p.id === x.partyId)?.name : "Onbekend / anoniem"}</TableCell><TableCell className="text-right"><Money value={x.amount} /></TableCell></TableRow>)}</TableBody>
+              <TableFooter><TableRow><TableCell>Totaal</TableCell><TableCell className="text-right"><Money value={sum(donations.map((x) => x.amount))} /></TableCell></TableRow></TableFooter>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
+      {isAdmin && <p className="text-sm text-muted-foreground print:hidden">De begroting pas je aan bij <a className="underline" href="#/begroting">Begroting</a>.</p>}
     </div>
-  );
-}
-
-function BudgetEditor({ fy }: { fy: FiscalYear }) {
-  const { store, actor } = useApp();
-  const { state } = useLedger();
-  const run = useAction();
-  const [potId, setPotId] = useState(state.pots[0]?.id ?? "");
-  const [kind, setKind] = useState<"income" | "expense">("expense");
-  const [amount, setAmount] = useState("");
-  return (
-    <Card className="print:hidden">
-      <CardHeader><CardTitle>Begroting {fy.label} aanpassen</CardTitle><CardDescription>Reserveren (bijv. voor het lustrum) doe je via potje Reserveringen; boek de dotatie bij Boekjaar.</CardDescription></CardHeader>
-      <CardContent className="grid gap-3 sm:grid-cols-4 sm:items-end">
-        <Field label="Potje"><Select value={potId} onChange={(e) => setPotId(e.target.value)}>{state.pots.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</Select></Field>
-        <Field label="Soort"><Select value={kind} onChange={(e) => setKind(e.target.value as "income" | "expense")}><option value="expense">Lasten</option><option value="income">Baten</option></Select></Field>
-        <Field label="Bedrag per jaar"><Input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="500,00" /></Field>
-        <Button onClick={() => run(() => { store.setBudget({ fiscalYearId: fy.id, potId, kind, amount: parseAmount(amount) }, actor); setAmount(""); }, "Begroting opgeslagen")}>Opslaan</Button>
-      </CardContent>
-    </Card>
   );
 }
 
@@ -421,8 +413,7 @@ export function SettingsPage({ onReset }: { onReset: () => void }) {
                 const file = e.target.files?.[0];
                 if (!file) return;
                 try {
-                  const next = JSON.parse(await file.text());
-                  if (next?.version !== 1 || !Array.isArray(next.entries)) throw new Error("Dit is geen back-up van deze boekhouding");
+                  const next = migrateState(JSON.parse(await file.text()));
                   if (!window.confirm("De huidige gegevens in deze browser worden vervangen door de back-up. Doorgaan?")) return;
                   store.replaceState(next);
                   const bad = store.verify().filter((c) => !c.ok);

@@ -6,7 +6,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { cents, parseEuroString } from "@/domain/money";
 import { fiscalYearFor, localDate } from "@/domain/dates";
-import { LedgerStore, today, type Actor, type State } from "./ledger";
+import { LedgerStore, migrateState, today, type Actor, type State } from "./ledger";
 import { createDemoState } from "./demo";
 import { App } from "./ui/app";
 import { Field, Select } from "./ui/core";
@@ -17,7 +17,7 @@ const KEY = "boekhouding-prototype-v1";
 function load(): State | null {
   try {
     const raw = localStorage.getItem(KEY);
-    return raw ? (JSON.parse(raw) as State) : null;
+    return raw ? migrateState(JSON.parse(raw)) : null;
   } catch {
     return null;
   }
@@ -91,9 +91,7 @@ function Welcome({ onStart }: { onStart: (s: State) => void }) {
 
   const startBackup = async (file: File) => {
     try {
-      const s = JSON.parse(await file.text());
-      if (s?.version !== 1 || !Array.isArray(s.entries)) throw new Error("Dit is geen back-up van deze boekhouding");
-      onStart(s);
+      onStart(migrateState(JSON.parse(await file.text())));
     } catch (err) {
       setError((err as Error).message);
     }

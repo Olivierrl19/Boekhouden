@@ -21,11 +21,15 @@ export function ActivitiesPage() {
   const [name, setName] = useState("");
   const [date, setDate] = useState("");
   const [potId, setPotId] = useState(state.pots.find((p) => p.code === "ACTIVITEITEN")?.id ?? "");
-  const open = state.activities.filter((a) => a.status === "open");
-  const settled = state.activities.filter((a) => a.status === "settled").slice().reverse();
+  const [q, setQ] = useState("");
+  const match = (a: { number: string; name: string }) => !q || `${a.number} ${a.name}`.toLowerCase().includes(q.toLowerCase());
+  const open = state.activities.filter((a) => a.status === "open" && match(a));
+  const settled = state.activities.filter((a) => a.status === "settled" && match(a)).slice().reverse();
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader title="Activiteiten" description="Alles wat je voor een activiteit uitgeeft of ontvangt staat op 'nog te verdelen'. Bij het afrekenen verdeel je het over de deelnemers." />
+      <PageHeader title="Activiteiten" description="Alles wat je voor een activiteit uitgeeft of ontvangt staat op 'nog te verdelen'. Bij het afrekenen verdeel je het over de deelnemers. Elke activiteit krijgt een vast nummer (A26-001), handig als betaalomschrijving.">
+        <Input placeholder="Zoek op nummer of naam…" value={q} onChange={(e) => setQ(e.target.value)} className="w-64" />
+      </PageHeader>
       <ReadOnlyNotice />
       {canEdit && (
         <Card>
@@ -43,10 +47,11 @@ export function ActivitiesPage() {
         <CardContent className="p-0">
           {open.length === 0 ? <Empty>Geen open activiteiten.</Empty> : (
             <Table>
-              <TableHeader><TableRow><TableHead>Activiteit</TableHead><TableHead>Datum</TableHead><TableHead>Potje</TableHead><TableHead className="text-right">Nog te verdelen</TableHead></TableRow></TableHeader>
+              <TableHeader><TableRow><TableHead>Nr.</TableHead><TableHead>Activiteit</TableHead><TableHead>Datum</TableHead><TableHead>Potje</TableHead><TableHead className="text-right">Nog te verdelen</TableHead></TableRow></TableHeader>
               <TableBody>
                 {open.map((a) => (
                   <TableRow key={a.id}>
+                    <TableCell className="font-mono text-xs">{a.number}</TableCell>
                     <TableCell><A to={`activiteit/${a.id}`}>{a.name}</A></TableCell>
                     <TableCell>{a.heldOn ? formatDateNl(a.heldOn) : "—"}</TableCell>
                     <TableCell>{d.potById.get(a.potId)?.name}</TableCell>
@@ -65,6 +70,7 @@ export function ActivitiesPage() {
             <TableBody>
               {settled.map((a) => (
                 <TableRow key={a.id}>
+                  <TableCell className="font-mono text-xs">{a.number}</TableCell>
                   <TableCell><A to={`activiteit/${a.id}`}>{a.name}</A></TableCell>
                   <TableCell>{a.heldOn ? formatDateNl(a.heldOn) : "—"}</TableCell>
                   <TableCell>{d.potById.get(a.potId)?.name}</TableCell>
@@ -101,7 +107,7 @@ export function ActivityPage({ id }: { id: string }) {
 
   return (
     <div className="flex flex-col gap-6">
-      <PageHeader title={act.name} description={<>{act.heldOn ? formatDateNl(act.heldOn) : "Geen datum"} · potje {d.potById.get(act.potId)?.name} · {act.status === "open" ? <Badge variant="warning">open</Badge> : <Badge variant="success">afgerekend</Badge>}</>}>
+      <PageHeader title={`${act.number} · ${act.name}`} description={<>{act.heldOn ? formatDateNl(act.heldOn) : "Geen datum"} · potje {d.potById.get(act.potId)?.name} · {act.status === "open" ? <Badge variant="warning">open</Badge> : <Badge variant="success">afgerekend</Badge>}</>}>
         <Button variant="outline" onClick={() => window.print()}><Printer /> Afdrukken / PDF</Button>
         {act.status === "settled" && canApprove && (
           <Button variant="outline" onClick={() => { const r = window.prompt("Waarom heropen je deze activiteit? De afrekening wordt tegengeboekt."); if (r) run(() => store.reopenActivity(act.id, r, actor), "Activiteit heropend"); }}><RotateCcw /> Heropenen</Button>
@@ -170,6 +176,7 @@ function SettlementForm({ activityId, balance }: { activityId: string; balance: 
     ...people.map((p) => ({ partyId: p.id, include: false, method: (p.kind === "external" ? "fixed" : "equal") as ShareMethod, weight: "1", fixed: "" })),
   ]);
   const [filter, setFilter] = useState("");
+  const [newExternal, setNewExternal] = useState({ name: "", amount: "" });
   const update = (i: number, patch: Partial<ShareRow>) => setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
 
   let shares: SettlementShareInput[] = [];
@@ -204,6 +211,17 @@ function SettlementForm({ activityId, balance }: { activityId: string; balance: 
           <Input placeholder="Zoek naam…" value={filter} onChange={(e) => setFilter(e.target.value)} className="w-48" />
           <Button variant="outline" size="sm" onClick={() => setRows(rows.map((r) => { const p = state.parties.find((x) => x.id === r.partyId); return p?.kind === "member" ? { ...r, include: true } : r; }))}>Alle leden</Button>
           <Button variant="outline" size="sm" onClick={() => setRows(rows.map((r) => ({ ...r, include: false })))}>Niemand</Button>
+        </div>
+        <div className="flex flex-wrap items-end gap-2 rounded-md border border-dashed p-3 text-sm">
+          <span className="w-full text-muted-foreground">Deed er een ander dispuut of een gast mee die nog niet in de lijst staat? Voeg toe met een vast bedrag:</span>
+          <Input placeholder="Naam, bijv. Dispuut Bacchus" value={newExternal.name} onChange={(e) => setNewExternal({ ...newExternal, name: e.target.value })} className="w-56" />
+          <Input placeholder="Bedrag" value={newExternal.amount} onChange={(e) => setNewExternal({ ...newExternal, amount: e.target.value })} className="w-28" />
+          <Button size="sm" variant="outline" onClick={() => run(() => {
+            if (newExternal.amount) parseAmount(newExternal.amount);
+            const p = store.createExternal({ name: newExternal.name }, actor);
+            setRows([...rows, { partyId: p.id, include: true, method: "fixed", weight: "1", fixed: newExternal.amount }]);
+            setNewExternal({ name: "", amount: "" });
+          }, "Externe toegevoegd")}>Toevoegen</Button>
         </div>
         <div className="max-h-[28rem] overflow-y-auto rounded-md border">
           <Table>

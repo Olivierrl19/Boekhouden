@@ -65,13 +65,13 @@ export function createDemoState(today: LocalDate): State {
       A,
     );
 
+    const startYear = Number(previous.startDate.slice(0, 4));
     const types = {
       lid: store.createMemberType({ name: "Lid", monthly: cents(1500) }, A),
       aspirant: store.createMemberType({ name: "Aspirant", monthly: cents(1000) }, A),
       oud: store.createMemberType({ name: "Oud-lid", monthly: cents(500) }, A),
       reunist: store.createMemberType({ name: "Reünist", monthly: cents(0) }, A),
     };
-    const startYear = Number(previous.startDate.slice(0, 4));
     const members = FIRST.map((first, i) => {
       const cohort = startYear - 4 + Math.floor(i / 7);
       const type = cohort <= startYear - 4 ? (i % 2 ? types.oud : types.reunist) : cohort === startYear ? types.aspirant : types.lid;
@@ -92,11 +92,32 @@ export function createDemoState(today: LocalDate): State {
     store.createExternal({ name: "Drankenhandel De Tap", ibans: [makeIban("RABO", "0123456789")] }, A);
     store.createExternal({ name: "Bakkerij Brood & Co", email: "info@brood.example", ibans: [makeIban("INGB", "0777888999")] }, A);
 
+    // Contribution income is divided over pots: half for the rent, the rest for activities, borrels and reservations.
+    store.setContributionKey([
+      { potId: pot("HUISVESTING").id, weight: 50 },
+      { potId: pot("ACTIVITEITEN").id, weight: 20 },
+      { potId: pot("BORRELS").id, weight: 10 },
+      { potId: pot("RESERVERINGEN").id, weight: 20 },
+    ], A);
+    const lustrum = store.createSavingsGoal({ name: "Lustrumreis 2028", targetDate: `${startYear + 3}-05-01` as LocalDate, monthly: cents(2000) }, A);
+    const wintersport = store.createSavingsGoal({ name: "Wintersport", targetDate: `${startYear + 1}-01-15` as LocalDate, monthly: cents(1000) }, A);
+
     for (const fy of s().fiscalYears) {
-      for (const [code, kind, amount] of [
-        ["CONTRIBUTIE", "income", 480000], ["SPONSORING", "income", 50000], ["HUISVESTING", "expense", 360000], ["BORRELS", "expense", 30000],
-        ["ACTIVITEITEN", "expense", 50000], ["BESTUUR", "expense", 20000], ["ALV", "expense", 10000], ["BANK", "expense", 15000], ["RESERVERINGEN", "expense", 50000],
-      ] as const) store.setBudget({ fiscalYearId: fy.id, potId: pot(code).id, kind, amount: cents(amount) }, A);
+      for (const [code, kind, description, amount] of [
+        ["HUISVESTING", "income", "Contributie (50%)", 240000],
+        ["ACTIVITEITEN", "income", "Contributie (20%)", 96000],
+        ["BORRELS", "income", "Contributie (10%)", 48000],
+        ["RESERVERINGEN", "income", "Contributie (20%)", 96000],
+        ["SPONSORING", "income", "Bakkerij Brood & Co", 50000],
+        ["DONATIES", "income", "Donaties oud-leden", 30000],
+        ["HUISVESTING", "expense", "Huur kelder (12 x € 300)", 360000],
+        ["BORRELS", "expense", "Dispuutsdeel borrels", 30000],
+        ["ACTIVITEITEN", "expense", "Bijdrage activiteiten", 50000],
+        ["BESTUUR", "expense", "Bestuursetentje en overdracht", 20000],
+        ["ALV", "expense", "Zaal en drukwerk ALV", 10000],
+        ["BANK", "expense", "Rabobank-kosten", 15000],
+        ["RESERVERINGEN", "expense", "Dotatie lustrumfonds", 50000],
+      ] as const) store.addBudgetLine({ fiscalYearId: fy.id, potId: pot(code).id, kind, description, amount: cents(amount) }, A);
     }
 
     // Bank simulation with a running balance and Rabobank volgnummers.
@@ -137,7 +158,21 @@ export function createDemoState(today: LocalDate): State {
         }
       }
       store.chargeContributions(first, A);
-      tx("checking", addDays(first, 1), -30000, "Stichting Studentenhuisvesting", "Huur kelder", makeIban("ABNA", "0555666777"), [{ kind: "pot", id: pot("HUISVESTING").id, amount: cents(-30000) }]);
+      // Members transfer their contribution themselves, early in the month (most of them).
+      const contributionDay = addDays(first, 2 + between(0, 2));
+      for (const m of payers(first)) {
+        const type = s().memberTypes.find((t) => t.id === s().parties.find((x) => x.id === m.id)!.member!.memberTypeId)!;
+        const open = derive(s(), false).contributionBalance.get(m.id) ?? 0;
+        if (open <= 0 || rand() > 0.88) continue;
+        const pay = open > type.monthly && rand() < 0.6 ? open : type.monthly; // most catch up when behind
+        tx("checking", contributionDay, pay, m.name, `Contributie ${first.slice(5, 7)}-${first.slice(0, 4)} ${m.member!.firstName}`, m.ibans[0], isCurrentMonth && rand() < 0.7 ? undefined : [{ kind: "contribution", id: m.id, amount: cents(pay) }]);
+      }
+      // Savings plans: many members put money aside each month.
+      for (const [i, m] of payers(first).entries()) {
+        if (i % 2 === 0 && rand() < 0.9) tx("checking", contributionDay, 2000, m.name, `Spaarplan lustrumreis ${m.member!.firstName}`, m.ibans[0], [{ kind: "savings", id: m.id, goalId: lustrum.id, amount: cents(2000) }]);
+        if (i % 3 === 1 && first < wintersport.targetDate! && rand() < 0.9) tx("checking", contributionDay, 1000, m.name, `Sparen wintersport ${m.member!.firstName}`, m.ibans[0], [{ kind: "savings", id: m.id, goalId: wintersport.id, amount: cents(1000) }]);
+      }
+      tx("checking", addDays(first, 4 + 1), -30000, "Stichting Studentenhuisvesting", "Huur kelder", makeIban("ABNA", "0555666777"), [{ kind: "pot", id: pot("HUISVESTING").id, amount: cents(-30000) }]);
       const borrel = store.createActivity({ name: `Borrel ${first.slice(5, 7)}-${first.slice(0, 4)}`, heldOn: addDays(first, 10), potId: pot("BORRELS").id }, A);
       const kegs = between(2, 4) * 11500;
       tx("checking", addDays(first, 8), -kegs, "Drankenhandel De Tap", "Fusten borrel", TAP, [{ kind: "activity", id: borrel.id, amount: cents(-kegs) }]);
@@ -162,8 +197,24 @@ export function createDemoState(today: LocalDate): State {
       if (first === addMonths(previous.startDate, 5)) {
         tx("checking", addDays(first, 11), 30000, "ABN AMRO Bank NV", `Tikkie ID 000123456, Winterfeest, Dispuut Bacchus, ${bacchus.ibans[0]}`, DEMO_IBAN.tikkie, [{ kind: "person", id: bacchus.id, amount: cents(30000) }]);
       }
+      if (first === addMonths(previous.startDate, 4) || first === addMonths(previous.startDate, 10)) {
+        for (const [i, m] of members.filter((x) => x.member!.memberTypeId === types.reunist.id || x.member!.memberTypeId === types.oud.id).slice(0, 4).entries()) {
+          const amount = [2500, 5000, 2000, 10000][i];
+          tx("checking", addDays(first, 15 + i), amount, m.name, `Donatie ${first.slice(0, 4)}, succes met het lustrum!`, m.ibans[0], [{ kind: "pot", id: pot("DONATIES").id, donorId: m.id, amount: cents(amount) }]);
+        }
+      }
       if (first === addMonths(previous.startDate, 6)) {
         tx("checking", addDays(first, 12), 50000, "Bakkerij Brood & Co", "Sponsoring", makeIban("INGB", "0777888999"), [{ kind: "pot", id: pot("SPONSORING").id, amount: cents(50000) }]);
+      }
+      if (first === addMonths(previous.startDate, 5)) {
+        const trip = store.createActivity({ name: "Wintersport", heldOn: wintersport.targetDate, potId: pot("ACTIVITEITEN").id }, A);
+        const goers = payers(first).filter((_, i) => i % 3 === 1);
+        tx("checking", addDays(first, 16), -goers.length * 42000, "Snowtravel", "Reis en skipas wintersport", makeIban("ABNA", "0999888777"), [{ kind: "activity", id: trip.id, amount: cents(-goers.length * 42000) }]);
+        flush();
+        const bal = derive(s(), false).activityBalance.get(trip.id)!;
+        store.settleActivity({ activityId: trip.id, date: addDays(first, 20), expectedBalance: bal, shares: goers.map((m) => ({ partyId: m.id, partyKind: "member" as const, method: "equal" as const })) }, A);
+        store.settleSavingsForGoal(wintersport.id, addDays(first, 20), "all", A);
+        store.updateSavingsGoal(wintersport.id, { name: wintersport.name, targetDate: wintersport.targetDate, monthly: wintersport.monthly, active: false }, A);
       }
       if (first === addMonths(previous.startDate, 10)) {
         tx("checking", addDays(first, 19), -100000, "Dispuut Demo", "Naar spaarrekening", DEMO_IBAN.savings);
@@ -210,6 +261,7 @@ export function createDemoState(today: LocalDate): State {
     // Work left to do: a few unassigned lines and claims waiting for approval.
     const someone = members[12];
     tx("checking", clamp(addDays(today, -3)), 4500, someone.name, "borrel + contributie", someone.ibans[0]);
+    tx("checking", clamp(addDays(today, -3)), 2000, members[16].name, "sparen", members[16].ibans[0]);
     tx("checking", clamp(addDays(today, -2)), -2399, "Albert Heijn 1234", "Betaalautomaat AH", null);
     tx("checking", clamp(addDays(today, -1)), 2500, "ABN AMRO Bank NV", `Tikkie ID 000987654, Borrel, Dispuut Bacchus, ${bacchus.ibans[0]}`, DEMO_IBAN.tikkie);
     flush();
@@ -225,7 +277,7 @@ export function createDemoState(today: LocalDate): State {
  */
 export function nextDemoCsv(state: State, today: LocalDate): { fileName: string; csv: string; count: number } {
   const checking = state.bankAccounts.find((b) => b.kind === "checking")!;
-  const txs = state.bankTransactions.filter((t) => t.bankAccountId === checking.id);
+  const txs = state.bankTransactions.filter((t) => t.bankAccountId === checking.id && !t.manual);
   const last = txs.at(-1);
   let volgnr = last ? Number(last.externalId) : 1;
   let balance: number = last?.balanceAfter ?? derive(state).bankBalance.get(checking.id) ?? 0;
@@ -233,9 +285,13 @@ export function nextDemoCsv(state: State, today: LocalDate): { fileName: string;
   const members = state.parties.filter((p) => p.kind === "member" && p.active && p.ibans.length);
   const bacchus = state.parties.find((p) => p.name === "Dispuut Bacchus");
   const d = derive(state);
-  const owing = members.filter((m) => (d.partyBalance.get(m.id) ?? 0) > 0).slice(0, 3);
+  const behind = members.filter((m) => (d.contributionBalance.get(m.id) ?? 0) > 0).slice(0, 4);
+  const owing = members.filter((m) => (d.partyBalance.get(m.id) ?? 0) > 0 && !behind.includes(m)).slice(0, 2);
+  const saver = members.find((m) => (d.savingsByParty.get(m.id) ?? 0) > 0);
   const rows: { amount: number; name: string; desc: string; iban: string | null }[] = [
-    ...owing.map((m) => ({ amount: d.partyBalance.get(m.id)!, name: m.name, desc: `Dispuut ${m.member?.firstName ?? m.name}`, iban: m.ibans[0] })),
+    ...behind.map((m) => ({ amount: state.memberTypes.find((t) => t.id === m.member!.memberTypeId)!.monthly, name: m.name, desc: `Contributie ${m.member?.firstName ?? ""}`, iban: m.ibans[0] })),
+    ...owing.map((m) => ({ amount: d.partyBalance.get(m.id)!, name: m.name, desc: `Borrels ${m.member?.firstName ?? m.name}`, iban: m.ibans[0] })),
+    ...(saver ? [{ amount: 2000, name: saver.name, desc: "Spaarplan lustrumreis", iban: saver.ibans[0] }] : []),
     ...(bacchus ? [{ amount: 1750, name: "ABN AMRO Bank NV", desc: `Tikkie ID 000555111, Borrel, Dispuut Bacchus, ${bacchus.ibans[0] ?? ""}`, iban: DEMO_IBAN.tikkie }] : []),
     { amount: -1845, name: "Jumbo Utrecht", desc: "Betaalautomaat, chips borrel", iban: null },
     { amount: -1250, name: "Rabobank", desc: "Kosten Rabo BasisPakket", iban: null },

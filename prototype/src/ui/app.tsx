@@ -1,11 +1,15 @@
 import { useCallback, useMemo, useState } from "react";
-import { BookOpen, CalendarCheck, Home, Landmark, ListChecks, Menu, PartyPopper, Receipt, Settings, ShieldCheck, User, Users, Wallet, BarChart3, X } from "lucide-react";
+import { BookOpen, Calculator, Handshake, PiggyBank, CalendarCheck, Home, Landmark, ListChecks, Menu, PartyPopper, Receipt, Settings, ShieldCheck, User, Users, Wallet, BarChart3, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { can, derive, type Actor, type LedgerStore } from "../ledger";
 import { AppProvider, Empty, Select, useApp, useLedger, useRoute } from "./core";
 import { BankPage } from "./page-bank";
-import { ContributionPage, DashboardPage, DebtorsPage, MembersPage, PersonPage } from "./page-people";
+import { DashboardPage, DebtorsPage, MembersPage, PersonPage } from "./page-people";
+import { ContributionPage } from "./page-contribution";
+import { SavingsPage } from "./page-savings";
+import { BudgetPage } from "./page-budget";
+import { ExternalsPage } from "./page-externals";
 import { ActivitiesPage, ActivityPage } from "./page-activities";
 import { ClaimsPage, MyPage } from "./page-claims";
 import { ControlPage, JournalPage, ReportsPage, SettingsPage, YearPage } from "./page-books";
@@ -98,8 +102,11 @@ function Shell({ onReset }: { onReset: () => void }) {
         { to: "debiteuren", label: "Debiteurenlijst", icon: Wallet },
         { to: "activiteiten", label: "Activiteiten", icon: PartyPopper },
         { to: "declaraties", label: "Declaraties", icon: Receipt, badge: pendingClaims },
-        { to: "leden", label: "Leden", icon: Users },
         { to: "contributie", label: "Contributie", icon: CalendarCheck },
+        { to: "spaarplannen", label: "Spaarplannen", icon: PiggyBank },
+        { to: "leden", label: "Leden", icon: Users },
+        { to: "externen", label: "Externen", icon: Handshake },
+        { to: "begroting", label: "Begroting", icon: Calculator },
         { to: "rapporten", label: "Rapportages", icon: BarChart3 },
         { to: "journaal", label: "Journaal", icon: BookOpen },
         { to: "boekjaar", label: "Boekjaar", icon: ListChecks },
@@ -122,6 +129,9 @@ function Shell({ onReset }: { onReset: () => void }) {
       case "declaraties": content = <ClaimsPage />; break;
       case "leden": content = <MembersPage />; break;
       case "contributie": content = <ContributionPage />; break;
+      case "spaarplannen": content = <SavingsPage />; break;
+      case "externen": content = <ExternalsPage />; break;
+      case "begroting": content = <BudgetPage />; break;
       case "rapporten": content = <ReportsPage />; break;
       case "journaal": content = <JournalPage />; break;
       case "boekjaar": content = <YearPage />; break;

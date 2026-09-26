@@ -90,8 +90,10 @@ export function bankTransactionImported(input: {
 
 export type AssignmentTarget =
   | { kind: "person"; partyId: string; partyKind: PartyKind; amount: Cents; description?: string }
+  | { kind: "contribution"; partyId: string; amount: Cents; description?: string }
+  | { kind: "savings"; partyId: string; goalId: string; amount: Cents; description?: string }
   | { kind: "activity"; activityId: string; amount: Cents; description?: string }
-  | { kind: "pot"; potId: string; accountId: string; amount: Cents; description?: string }
+  | { kind: "pot"; potId: string; accountId: string; amount: Cents; description?: string; relatedPartyId?: string | null }
   | { kind: "purchase_invoice"; invoiceId: string; partyId: string; amount: Cents; description?: string }
   | { kind: "sales_invoice"; invoiceId: string; partyId: string; amount: Cents; description?: string }
   | { kind: "internal"; amount: Cents; description?: string };
@@ -100,7 +102,10 @@ function assignmentTemplate(target: AssignmentTarget): TemplateCode {
   const incoming = target.amount > 0;
   switch (target.kind) {
     case "person":
+    case "contribution":
       return incoming ? "T02" : "T03";
+    case "savings":
+      return "T33";
     case "activity":
       return incoming ? "T10" : "T07";
     case "pot":
@@ -121,10 +126,14 @@ function assignmentLine(target: AssignmentTarget): LineDraft {
   switch (target.kind) {
     case "person":
       return { account: personAccount(target.partyKind), amount, partyId: target.partyId, description };
+    case "contribution":
+      return { account: { key: "CONTRIBUTION_RECEIVABLE" }, amount, partyId: target.partyId, description };
+    case "savings":
+      return { account: { key: "MEMBER_SAVINGS" }, amount, partyId: target.partyId, savingsGoalId: target.goalId, description };
     case "activity":
       return { account: { key: "TO_DISTRIBUTE" }, amount, activityId: target.activityId, description };
     case "pot":
-      return { account: { id: target.accountId }, amount, potId: target.potId, description };
+      return { account: { id: target.accountId }, amount, potId: target.potId, relatedPartyId: target.relatedPartyId ?? null, description };
     case "purchase_invoice":
       return {
         account: { key: "ACCOUNTS_PAYABLE" },
@@ -179,16 +188,23 @@ export function assignBankTransaction(input: {
 // T01 — monthly contribution
 // ---------------------------------------------------------------------------
 
+/**
+ * The monthly contribution is owed on the member's contribution account (1305) and booked as
+ * income on account Contributie, divided over pots with the association's key (verdeelsleutel).
+ */
 export function contributionCharged(input: {
   chargeId: string;
   partyId: string;
   month: LocalDate; // first day of month, also the booking date
   amount: Cents;
-  potId: string;
   incomeAccountId: string;
+  /** Pots with integer weights (e.g. percentages). The income is split exactly (largest remainder). */
+  split: { potId: string; weight: number }[];
   description: string;
 }): EntryDraft {
   if (input.amount <= 0) throw new LedgerError("Contributie moet positief zijn");
+  if (input.split.length === 0) throw new LedgerError("De contributie-verdeelsleutel is leeg");
+  const parts = allocate(input.amount, input.split.map((p) => p.weight));
   return build({
     date: input.month,
     template: "T01",
@@ -197,8 +213,32 @@ export function contributionCharged(input: {
     sourceId: input.chargeId,
     isAutomatic: true,
     lines: [
-      { account: { key: "MEMBER_ACCOUNTS" }, amount: input.amount, partyId: input.partyId },
-      { account: { id: input.incomeAccountId }, amount: negate(input.amount), potId: input.potId },
+      { account: { key: "CONTRIBUTION_RECEIVABLE" }, amount: input.amount, partyId: input.partyId },
+      ...input.split
+        .map((p, i) => ({ account: { id: input.incomeAccountId }, amount: negate(parts[i]), potId: p.potId }))
+        .filter((l) => l.amount !== 0),
+    ],
+  });
+}
+
+// T32 — use a member's savings (spaarplan) to pay what they owe on their account
+export function savingsSettled(input: {
+  partyId: string;
+  goalId: string;
+  goalName: string;
+  date: LocalDate;
+  amount: Cents; // > 0: moved from savings to the member's account
+}): EntryDraft {
+  nonZero(input.amount, "Bedrag");
+  return build({
+    date: input.date,
+    template: "T32",
+    description: `Spaargeld ${input.goalName} verrekend`,
+    sourceType: "savings_goal",
+    sourceId: input.goalId,
+    lines: [
+      { account: { key: "MEMBER_SAVINGS" }, amount: input.amount, partyId: input.partyId, savingsGoalId: input.goalId },
+      { account: { key: "MEMBER_ACCOUNTS" }, amount: negate(input.amount), partyId: input.partyId },
     ],
   });
 }
@@ -468,6 +508,8 @@ export interface PostedLine {
   partyId: string | null;
   bankTransactionId: string | null;
   invoiceId: string | null;
+  savingsGoalId?: string | null;
+  relatedPartyId?: string | null;
   description: string | null;
 }
 
@@ -494,6 +536,8 @@ export function mirrorEntry(input: {
       partyId: l.partyId,
       bankTransactionId: l.bankTransactionId,
       invoiceId: l.invoiceId,
+      savingsGoalId: l.savingsGoalId ?? null,
+      relatedPartyId: l.relatedPartyId ?? null,
       description: l.description,
     })),
   });

@@ -239,7 +239,7 @@ async function run(b: Basic, events: Event[], closeYear: boolean) {
   const balances = await accountBalances(db, fy);
   const byKey = (k: string) => balances.find((a) => a.systemKey === k)!.balance;
   const persons = await partyBalances(db);
-  expect(byKey("MEMBER_ACCOUNTS")).toBe(sum(persons.filter((p) => p.kind === "member").map((p) => p.balance)));
+  expect(byKey("MEMBER_ACCOUNTS") + byKey("CONTRIBUTION_RECEIVABLE")).toBe(sum(persons.filter((p) => p.kind === "member").map((p) => p.balance)));
   expect(byKey("EXTERNAL_ACCOUNTS") + byKey("ACCOUNTS_PAYABLE")).toBe(
     sum(persons.filter((p) => p.kind === "external").map((p) => p.balance)),
   );

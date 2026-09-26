@@ -19,6 +19,7 @@ import {
   expenseClaimApproved,
   memorial,
   mirrorEntry,
+  savingsSettled,
   openingBalance,
   reserveDotation,
   validateDraft,
@@ -31,7 +32,7 @@ import {
 import { LedgerError, type AccountRef, type EntryDraft, type LineDraft, type SystemKey } from "@/domain/ledger/types";
 import { DEFAULT_ACCOUNTS, DEFAULT_POTS, type AccountType } from "@/domain/ledger/chart";
 import { cents, formatEuro, sum, type Cents } from "@/domain/money";
-import { addDays, fiscalYearFor, firstOfMonth, formatMonthNl, localDate, type LocalDate } from "@/domain/dates";
+import { addDays, addMonths, fiscalYearFor, firstOfMonth, formatMonthNl, localDate, type LocalDate } from "@/domain/dates";
 import { isValidIban, normalizeIban } from "@/domain/bank/iban";
 import type { NormalizedBankTransaction } from "@/domain/bank/types";
 import { payerIban, suggestAssignment, type Suggestion, type SuggestionTarget } from "@/domain/bank/suggestions";
@@ -73,7 +74,15 @@ export interface Party {
   member: { firstName: string; lastName: string; memberTypeId: string; cohort: number | null; joinedOn: LocalDate; leftOn: LocalDate | null } | null;
 }
 export interface BankAccount { id: string; name: string; iban: string | null; kind: "checking" | "savings" | "cash"; ledgerAccountId: string }
-export interface BankTx extends NormalizedBankTransaction { id: string; bankAccountId: string; importedAt: string }
+export interface BankTx extends NormalizedBankTransaction {
+  id: string;
+  bankAccountId: string;
+  importedAt: string;
+  /** Entered by hand (no bank file yet). A later bank import links to it instead of booking it twice. */
+  manual?: boolean;
+  /** Volgnummer of the bank-file transaction this manual entry was matched with. */
+  matchedExternalId?: string | null;
+}
 export interface Line {
   accountId: string;
   amount: Cents;
@@ -82,6 +91,8 @@ export interface Line {
   partyId: string | null;
   bankTransactionId: string | null;
   invoiceId: string | null;
+  savingsGoalId?: string | null;
+  relatedPartyId?: string | null;
   description: string | null;
 }
 export interface Entry {
@@ -100,7 +111,8 @@ export interface Entry {
   createdAt: string;
   lines: Line[];
 }
-export interface Activity { id: string; name: string; heldOn: LocalDate | null; potId: string; status: "open" | "settled"; settlementEntryId: string | null; createdAt: string }
+export interface Activity { id: string; number: string; name: string; heldOn: LocalDate | null; potId: string; status: "open" | "settled"; settlementEntryId: string | null; createdAt: string }
+export interface SavingsGoal { id: string; name: string; targetDate: LocalDate | null; monthly: Cents; active: boolean }
 export interface Claim {
   id: string;
   partyId: string;
@@ -115,14 +127,23 @@ export interface Claim {
   decidedAt: string | null;
 }
 export interface AuditRecord { id: number; at: string; actor: string; action: string; data: unknown; reason: string | null; prevHash: string | null; hash: string }
-export interface Budget { fiscalYearId: string; potId: string; kind: "income" | "expense"; amount: Cents }
+export interface BudgetLine { id: string; fiscalYearId: string; potId: string; kind: "income" | "expense"; description: string; amount: Cents }
 
 export interface State {
-  version: 1;
-  settings: { name: string; paymentIban: string; paymentAccountName: string; fiscalYearStartMonth: number; isDemo: boolean };
+  version: 2;
+  settings: {
+    name: string;
+    paymentIban: string;
+    paymentAccountName: string;
+    fiscalYearStartMonth: number;
+    isDemo: boolean;
+    /** How contribution income is divided over pots (integer weights, e.g. percentages). */
+    contributionKey: { potId: string; weight: number }[];
+  };
   accounts: Account[];
   pots: Pot[];
-  budgets: Budget[];
+  budgets: BudgetLine[];
+  savingsGoals: SavingsGoal[];
   fiscalYears: FiscalYear[];
   memberTypes: MemberType[];
   parties: Party[];
@@ -149,8 +170,16 @@ export interface Derived {
   entryById: Map<string, Entry>;
   reversedIds: Set<string>;
   bankByLedger: Map<string, BankAccount>;
-  /** Balance per party (all person accounts). */
+  /** Balance of each person's current account (rekening: borrels, activities, claims, externals). */
   partyBalance: Map<string, Cents>;
+  /** Open contribution per member (> 0 = still to pay, < 0 = paid in advance). */
+  contributionBalance: Map<string, Cents>;
+  /** Savings per member per goal, key `${partyId}|${goalId}` (positive = saved). */
+  savings: Map<string, Cents>;
+  /** Total savings per member. */
+  savingsByParty: Map<string, Cents>;
+  /** Total saved per goal. */
+  savingsByGoal: Map<string, Cents>;
   /** "Nog te verdelen" per activity. */
   activityBalance: Map<string, Cents>;
   /** Suspense (1099) balance per bank transaction. 0 or missing = assigned. */
@@ -174,6 +203,13 @@ export function derive(state: State, useCache = true): Derived {
   const suspense = accountByKey.get("BANK_SUSPENSE")?.id;
   const toDistribute = accountByKey.get("TO_DISTRIBUTE")?.id;
   const partyBalance = new Map<string, number>();
+  const personAccounts = new Set(["MEMBER_ACCOUNTS", "EXTERNAL_ACCOUNTS", "ACCOUNTS_PAYABLE"].map((k) => accountByKey.get(k)?.id));
+  const contributionAccount = accountByKey.get("CONTRIBUTION_RECEIVABLE")?.id;
+  const savingsAccount = accountByKey.get("MEMBER_SAVINGS")?.id;
+  const contributionBalance = new Map<string, number>();
+  const savings = new Map<string, number>();
+  const savingsByParty = new Map<string, number>();
+  const savingsByGoal = new Map<string, number>();
   const activityBalance = new Map<string, number>();
   const suspenseByTx = new Map<string, number>();
   const bankLedgerBalance = new Map<string, number>();
@@ -181,7 +217,14 @@ export function derive(state: State, useCache = true): Derived {
   for (const e of state.entries) {
     if (e.reversesEntryId) reversedIds.add(e.reversesEntryId);
     for (const l of e.lines) {
-      if (l.partyId) partyBalance.set(l.partyId, (partyBalance.get(l.partyId) ?? 0) + l.amount);
+      if (l.partyId && personAccounts.has(l.accountId)) partyBalance.set(l.partyId, (partyBalance.get(l.partyId) ?? 0) + l.amount);
+      if (l.partyId && l.accountId === contributionAccount) contributionBalance.set(l.partyId, (contributionBalance.get(l.partyId) ?? 0) + l.amount);
+      if (l.partyId && l.accountId === savingsAccount) {
+        const k = `${l.partyId}|${l.savingsGoalId ?? ""}`;
+        savings.set(k, (savings.get(k) ?? 0) - l.amount);
+        savingsByParty.set(l.partyId, (savingsByParty.get(l.partyId) ?? 0) - l.amount);
+        savingsByGoal.set(l.savingsGoalId ?? "", (savingsByGoal.get(l.savingsGoalId ?? "") ?? 0) - l.amount);
+      }
       if (l.accountId === toDistribute && l.activityId) activityBalance.set(l.activityId, (activityBalance.get(l.activityId) ?? 0) + l.amount);
       if (l.accountId === suspense && l.bankTransactionId) suspenseByTx.set(l.bankTransactionId, (suspenseByTx.get(l.bankTransactionId) ?? 0) + l.amount);
       if (bankByLedger.has(l.accountId)) bankLedgerBalance.set(l.accountId, (bankLedgerBalance.get(l.accountId) ?? 0) + l.amount);
@@ -197,6 +240,10 @@ export function derive(state: State, useCache = true): Derived {
     reversedIds,
     bankByLedger,
     partyBalance: partyBalance as Map<string, Cents>,
+    contributionBalance: contributionBalance as Map<string, Cents>,
+    savings: savings as Map<string, Cents>,
+    savingsByParty: savingsByParty as Map<string, Cents>,
+    savingsByGoal: savingsByGoal as Map<string, Cents>,
     activityBalance: activityBalance as Map<string, Cents>,
     suspenseByTx: suspenseByTx as Map<string, Cents>,
     unassigned: state.bankTransactions.filter((t) => (suspenseByTx.get(t.id) ?? 0) !== 0),
@@ -239,6 +286,109 @@ export function resultByPot(state: State, fy: FiscalYear, opts: { excludeClosing
   return out;
 }
 
+export type MonthStatus = "paid" | "partial" | "open";
+export interface ContributionRow {
+  party: Party;
+  months: Map<LocalDate, { charged: Cents; covered: Cents; status: MonthStatus }>;
+  charged: Cents; // this fiscal year
+  open: Cents; // all time, > 0 still to pay
+  advance: Cents; // paid ahead (credit)
+}
+
+/**
+ * Who paid their contribution: payments on the contribution account are matched to the oldest
+ * months first (FIFO), so each month shows paid / partly paid / open.
+ */
+export function contributionOverview(state: State, fy: FiscalYear): { months: LocalDate[]; rows: ContributionRow[] } {
+  const d = derive(state);
+  const account = d.accountByKey.get("CONTRIBUTION_RECEIVABLE")?.id;
+  const months: LocalDate[] = [];
+  for (let m = fy.startDate; m <= fy.endDate; m = addMonths(m, 1)) months.push(m);
+  const charges = new Map<string, { month: LocalDate; amount: number }[]>();
+  const paid = new Map<string, number>();
+  for (const e of state.entries) {
+    for (const l of e.lines) {
+      if (l.accountId !== account || !l.partyId) continue;
+      if (e.template === "T01" && !d.reversedIds.has(e.id)) {
+        charges.set(l.partyId, [...(charges.get(l.partyId) ?? []), { month: e.date, amount: l.amount }]);
+      } else if (!(e.reversesEntryId && d.entryById.get(e.reversesEntryId)?.template === "T01")) {
+        paid.set(l.partyId, (paid.get(l.partyId) ?? 0) - l.amount);
+      }
+    }
+  }
+  const rows: ContributionRow[] = [];
+  for (const party of state.parties.filter((p) => p.member)) {
+    const list = (charges.get(party.id) ?? []).sort((a, b) => (a.month < b.month ? -1 : 1));
+    let pool = paid.get(party.id) ?? 0;
+    const map = new Map<LocalDate, { charged: Cents; covered: Cents; status: MonthStatus }>();
+    let charged = 0;
+    for (const c of list) {
+      const covered = Math.max(0, Math.min(pool, c.amount));
+      pool -= covered;
+      if (c.month >= fy.startDate && c.month <= fy.endDate) {
+        charged += c.amount;
+        map.set(c.month, { charged: cents(c.amount), covered: cents(covered), status: covered >= c.amount ? "paid" : covered > 0 ? "partial" : "open" });
+      }
+    }
+    const balance = d.contributionBalance.get(party.id) ?? 0;
+    if (!list.length && balance === 0 && !party.active) continue;
+    rows.push({ party, months: map, charged: cents(charged), open: cents(Math.max(0, balance)), advance: cents(Math.max(0, -balance)) });
+  }
+  rows.sort((a, b) => a.party.name.localeCompare(b.party.name));
+  return { months, rows };
+}
+
+/** Donations per giver (informational party on lines of the donations pot) for a fiscal year. */
+export function donationsByGiver(state: State, fy: FiscalYear): { partyId: string | null; amount: Cents }[] {
+  const d = derive(state);
+  const pot = state.pots.find((p) => p.code === "DONATIES");
+  const out = new Map<string | null, number>();
+  for (const e of state.entries) {
+    if (e.fiscalYearId !== fy.id || e.template === "T25") continue;
+    for (const l of e.lines) {
+      if (l.potId !== pot?.id || d.accountById.get(l.accountId)?.type !== "income") continue;
+      out.set(l.relatedPartyId ?? null, (out.get(l.relatedPartyId ?? null) ?? 0) - l.amount);
+    }
+  }
+  return [...out].map(([partyId, amount]) => ({ partyId, amount: cents(amount) })).filter((x) => x.amount !== 0).sort((a, b) => b.amount - a.amount);
+}
+
+/** Upgrade a saved state (e.g. an older backup) to the current version. */
+export function migrateState(raw: unknown): State {
+  const s = raw as State & { version: number; budgets: unknown[] };
+  if (!s || !Array.isArray(s.entries)) throw new Error("Dit is geen back-up van deze boekhouding");
+  if (s.version === 2) return s;
+  if (s.version !== 1) throw new Error(`Onbekende versie ${s.version}`);
+  const nextId = (p: string) => `${p}${(++s.seq).toString(36)}`;
+  const add = (code: string) => {
+    const def = DEFAULT_ACCOUNTS.find((a) => a.code === code)!;
+    if (s.accounts.some((a) => a.code === code)) return;
+    s.accounts.push({ id: nextId("a"), code, name: def.name, type: def.type, systemKey: def.systemKey ?? null, partyKind: def.partyKind ?? null, requiresActivity: false, manualPostingAllowed: true, active: true });
+  };
+  add("1305");
+  add("1740");
+  const donations = s.accounts.find((a) => a.code === "8110");
+  if (donations) donations.systemKey = "DONATIONS";
+  if (!s.pots.some((p) => p.code === "DONATIES") && donations) {
+    const general = s.pots.find((p) => p.code === "ALGEMEEN")!;
+    s.pots.push({ id: nextId("p"), code: "DONATIES", name: "Donaties", incomeAccountId: donations.id, expenseAccountId: general.expenseAccountId });
+  }
+  const old = s.budgets as unknown as { fiscalYearId: string; potId: string; kind: "income" | "expense"; amount: Cents }[];
+  s.budgets = old.map((b) => ({ id: nextId("bl"), fiscalYearId: b.fiscalYearId, potId: b.potId, kind: b.kind, description: "Begroting", amount: b.amount }));
+  s.savingsGoals = [];
+  s.settings.contributionKey = [{ potId: s.pots.find((p) => p.code === "CONTRIBUTIE")!.id, weight: 100 }];
+  const counters = new Map<string, number>();
+  for (const a of s.activities as (Activity & { number?: string })[]) {
+    const fy = fiscalYearFor(a.heldOn ?? localDate(a.createdAt.slice(0, 10)), s.settings.fiscalYearStartMonth);
+    const prefix = `A${fy.startDate.slice(2, 4)}-`;
+    const n = (counters.get(prefix) ?? 0) + 1;
+    counters.set(prefix, n);
+    a.number = `${prefix}${String(n).padStart(3, "0")}`;
+  }
+  s.version = 2;
+  return s;
+}
+
 export function currentFiscalYear(state: State, today: LocalDate): FiscalYear | null {
   return (
     state.fiscalYears.find((f) => f.startDate <= today && f.endDate >= today) ??
@@ -272,6 +422,16 @@ function require(actor: Actor, capability: Capability) {
 // ---------------------------------------------------------------------------
 
 export class ImportError extends Error {}
+
+/** One destination of a bank transaction as chosen in the UI ("waar geboekt"). */
+export interface AssignPart {
+  kind: "person" | "contribution" | "savings" | "activity" | "pot" | "internal";
+  id?: string; // party, activity or pot
+  goalId?: string; // savings goal
+  donorId?: string | null; // informational, for donations to a pot
+  amount: Cents;
+  description?: string;
+}
 
 export interface ImportResult { added: number; duplicates: number; autoAssigned: number; accounts: string[] }
 
@@ -388,6 +548,10 @@ export class LedgerStore {
         if (!act) throw new LedgerError("Onbekende activiteit");
         if (act.status !== "open") throw new LedgerError(`Activiteit "${act.name}" is afgerekend; heropen de activiteit eerst`);
       }
+      if (acc.systemKey === "MEMBER_SAVINGS") {
+        if (!l.savingsGoalId || !s.savingsGoals.some((g) => g.id === l.savingsGoalId)) throw new LedgerError("Kies een spaardoel");
+      } else if (l.savingsGoalId) throw new LedgerError("Een spaardoel hoort alleen bij spaartegoeden");
+      if (l.relatedPartyId && !s.parties.some((p) => p.id === l.relatedPartyId)) throw new LedgerError("Onbekende persoon");
       if (manual && !acc.manualPostingAllowed) throw new LedgerError(`Op rekening ${acc.code} ${acc.name} kan niet handmatig worden geboekt`);
       if (acc.systemKey === "BANK_SUSPENSE" && !l.bankTransactionId) throw new LedgerError("Te verwerken bankmutaties kan alleen via een banktransactie");
       const bank = s.bankAccounts.find((b) => b.ledgerAccountId === acc.id);
@@ -413,6 +577,8 @@ export class LedgerStore {
         partyId: l.partyId ?? null,
         bankTransactionId: l.bankTransactionId ?? null,
         invoiceId: l.invoiceId ?? null,
+        savingsGoalId: l.savingsGoalId ?? null,
+        relatedPartyId: l.relatedPartyId ?? null,
         description: l.description ?? null,
       };
     });
@@ -465,9 +631,9 @@ export class LedgerStore {
       if (!isValidIban(iban)) throw new LedgerError(`Ongeldig IBAN: ${iban}`);
     }
     const s: State = {
-      version: 1,
-      settings: { name: input.name, paymentIban: normalizeIban(input.checkingIban), paymentAccountName: input.name, fiscalYearStartMonth: input.fiscalYearStartMonth, isDemo: !!input.isDemo },
-      accounts: [], pots: [], budgets: [], fiscalYears: [], memberTypes: [], parties: [], bankAccounts: [],
+      version: 2,
+      settings: { name: input.name, paymentIban: normalizeIban(input.checkingIban), paymentAccountName: input.name, fiscalYearStartMonth: input.fiscalYearStartMonth, isDemo: !!input.isDemo, contributionKey: [] },
+      accounts: [], pots: [], budgets: [], savingsGoals: [], fiscalYears: [], memberTypes: [], parties: [], bankAccounts: [],
       bankTransactions: [], entries: [], activities: [], contributionMonths: [], claims: [], audit: [], seq: 0,
     };
     const nextId = (p: string) => `${p}${(++s.seq).toString(36)}`;
@@ -491,6 +657,7 @@ export class LedgerStore {
     for (const p of DEFAULT_POTS) {
       s.pots.push({ id: nextId("p"), code: p.code, name: p.name, incomeAccountId: byCode.get(p.income!)!, expenseAccountId: byCode.get(p.expense!)! });
     }
+    s.settings.contributionKey = [{ potId: s.pots.find((p) => p.code === "CONTRIBUTIE")!.id, weight: 100 }];
     const fy = fiscalYearFor(input.startDate, input.fiscalYearStartMonth);
     s.fiscalYears.push({ id: nextId("f"), label: fy.label, startDate: fy.startDate, endDate: fy.endDate, status: "open", nextEntryNumber: 1 });
     return s;
@@ -642,40 +809,65 @@ export class LedgerStore {
   }
 
   private importForAccount(s: State, bank: BankAccount, list: NormalizedBankTransaction[], actor: Actor) {
-    const existing = new Map(s.bankTransactions.filter((t) => t.bankAccountId === bank.id).map((t) => [t.externalId, t]));
+    const own = s.bankTransactions.filter((t) => t.bankAccountId === bank.id);
+    const existing = new Map<string, BankTx>();
+    for (const t of own) {
+      existing.set(t.externalId, t);
+      if (t.matchedExternalId) existing.set(t.matchedExternalId, t);
+    }
     const seen = new Set<string>();
-    const fresh: NormalizedBankTransaction[] = [];
+    let fresh: NormalizedBankTransaction[] = [];
     let duplicates = 0;
     for (const t of list) {
       if (seen.has(t.externalId)) throw new ImportError(`Volgnummer ${t.externalId} komt twee keer voor in het bestand`);
       seen.add(t.externalId);
       const old = existing.get(t.externalId);
       if (old) {
-        if (old.amount !== t.amount || old.bookingDate !== t.bookingDate || old.balanceAfter !== t.balanceAfter) {
-          throw new ImportError(`Transactie ${t.externalId} wijkt af van een eerder geïmporteerde transactie met hetzelfde volgnummer`);
-        }
+        const differs = old.manual ? old.amount !== t.amount : old.amount !== t.amount || old.bookingDate !== t.bookingDate || old.balanceAfter !== t.balanceAfter;
+        if (differs) throw new ImportError(`Transactie ${t.externalId} wijkt af van een eerder geïmporteerde transactie met hetzelfde volgnummer`);
         duplicates++;
       } else fresh.push(t);
     }
     // Keep bank order (volgnr) within a day.
     fresh.sort((a, b) => (a.bookingDate === b.bookingDate ? Number(a.externalId) - Number(b.externalId) || 0 : a.bookingDate < b.bookingDate ? -1 : 1));
 
+    // Transactions entered by hand earlier are linked to their bank-file counterpart (same amount,
+    // at most 3 days apart) instead of being booked a second time.
+    const dayDiff = (a: string, b: string) => Math.abs(Date.parse(a) - Date.parse(b)) / 86_400_000;
+    let matched = 0;
+    const manualOpen = own.filter((t) => t.manual && !t.matchedExternalId);
+    fresh = fresh.filter((t) => {
+      const m = manualOpen.find((x) => !x.matchedExternalId && x.amount === t.amount && dayDiff(x.bookingDate, t.bookingDate) <= 3);
+      if (!m) return true;
+      m.matchedExternalId = t.externalId;
+      m.balanceAfter = t.balanceAfter;
+      if (!m.counterpartyIban && t.counterpartyIban) m.counterpartyIban = t.counterpartyIban;
+      matched++;
+      return false;
+    });
+
+    const lastRow = [...list].filter((t) => t.balanceAfter !== null).sort((a, b) => (a.bookingDate === b.bookingDate ? Number(a.externalId) - Number(b.externalId) : a.bookingDate < b.bookingDate ? -1 : 1)).at(-1);
+    const unmatchedManual = () => s.bankTransactions.filter((t) => t.bankAccountId === bank.id && t.manual && !t.matchedExternalId);
+    const simpleChain = matched === 0 && unmatchedManual().length === 0;
+
     if (fresh.length && fresh.some((t) => t.balanceAfter !== null)) {
-      const last = [...existing.values()].sort((a, b) => (a.bookingDate < b.bookingDate ? 1 : -1))[0];
+      if (fresh.some((t) => t.balanceAfter === null)) throw new ImportError("Niet alle transacties hebben een saldo na transactie");
+      const last = own.filter((t) => !t.manual).sort((a, b) => (a.bookingDate < b.bookingDate ? 1 : -1))[0];
       if (last && fresh[0].bookingDate < last.bookingDate) {
         throw new ImportError(`Nieuwe transactie van ${fresh[0].bookingDate} ligt vóór de laatst geïmporteerde transactie (${last.bookingDate}). Exporteer een periode die aansluit op de vorige import.`);
       }
-      let running: number = this.dv(s).bankBalance.get(bank.id) ?? 0;
-      for (const t of fresh) {
-        if (t.balanceAfter === null) throw new ImportError("Niet alle transacties hebben een saldo na transactie");
-        const before = t.balanceAfter - t.amount;
-        if (before !== running) {
-          throw new ImportError(
-            `Saldo sluit niet aan vóór transactie ${t.externalId} van ${t.bookingDate}: de boekhouding verwacht ${formatEuro(cents(running))}, de bank meldt ${formatEuro(cents(before))}. ` +
-              `Er ontbreken transacties (of de beginbalans klopt niet). Exporteer een periode die aansluit op de vorige import.`,
-          );
+      if (simpleChain) {
+        let running: number = this.dv(s).bankBalance.get(bank.id) ?? 0;
+        for (const t of fresh) {
+          const before = (t.balanceAfter as number) - t.amount;
+          if (before !== running) {
+            throw new ImportError(
+              `Saldo sluit niet aan vóór transactie ${t.externalId} van ${t.bookingDate}: de boekhouding verwacht ${formatEuro(cents(running))}, de bank meldt ${formatEuro(cents(before))}. ` +
+                `Er ontbreken transacties (of de beginbalans klopt niet). Exporteer een periode die aansluit op de vorige import.`,
+            );
+          }
+          running = t.balanceAfter as number;
         }
-        running = t.balanceAfter;
       }
     }
 
@@ -685,13 +877,57 @@ export class LedgerStore {
       s.bankTransactions.push(tx);
       if (t.amount === 0) continue;
       this.post(s, bankTransactionImported({ tx: { id: tx.id, date: tx.bookingDate, amount: tx.amount, description: tx.description || tx.counterpartyName || "Banktransactie" }, bankLedgerAccountId: bank.ledgerAccountId, isCash: bank.kind === "cash" }), actor);
-      const own = s.bankAccounts.some((b) => b.iban && b.iban === tx.counterpartyIban && b.id !== bank.id);
-      if (own) {
+      const isOwn = s.bankAccounts.some((b) => b.iban && b.iban === tx.counterpartyIban && b.id !== bank.id);
+      if (isOwn) {
         this.assignIn(s, tx.id, [{ kind: "internal", amount: tx.amount }], actor, { isAutomatic: true });
         autoAssigned++;
       }
     }
-    return { added: fresh.length, duplicates, autoAssigned };
+
+    // With hand-entered transactions involved, check the end result against the bank's saldo.
+    if (!simpleChain && lastRow && lastRow.balanceAfter !== null) {
+      const stray = unmatchedManual().filter((t) => t.bookingDate <= lastRow.bookingDate);
+      if (stray.length) {
+        throw new ImportError(
+          `De met de hand toegevoegde transactie(s) ${stray.map((t) => `${formatEuro(t.amount)} op ${t.bookingDate}`).join(", ")} staan niet in het bankbestand. Controleer ze (bedrag of datum) en maak ze zo nodig ongedaan.`,
+        );
+      }
+      const later = sum(unmatchedManual().map((t) => t.amount));
+      const ledger = (this.dv(s).bankBalance.get(bank.id) ?? 0) - later;
+      if (ledger !== lastRow.balanceAfter) {
+        throw new ImportError(`Na de import sluit het saldo niet aan: de boekhouding komt op ${formatEuro(cents(ledger))}, de bank op ${formatEuro(lastRow.balanceAfter)}. Er ontbreken transacties.`);
+      }
+    }
+    return { added: fresh.length, duplicates: duplicates + matched, autoAssigned };
+  }
+
+  /** Enter a bank transaction by hand (no export available yet). A later import links to it. */
+  addManualBankTransaction(
+    input: { bankAccountId: string; date: LocalDate; amount: Cents; counterpartyName: string; counterpartyIban: string | null; description: string },
+    actor: Actor,
+  ): string {
+    require(actor, "edit");
+    return this.transact((s) => {
+      const bank = s.bankAccounts.find((b) => b.id === input.bankAccountId && b.kind !== "cash");
+      if (!bank) throw new LedgerError("Kies een bankrekening");
+      if (input.amount === 0) throw new LedgerError("Bedrag mag niet 0 zijn");
+      if (!input.counterpartyName.trim() && !input.description.trim()) throw new LedgerError("Vul een tegenpartij of omschrijving in");
+      const iban = input.counterpartyIban?.trim() ? normalizeIban(input.counterpartyIban) : null;
+      if (iban && !isValidIban(iban)) throw new LedgerError(`Ongeldig IBAN: ${input.counterpartyIban}`);
+      const n = s.bankTransactions.filter((t) => t.manual).length + 1;
+      const tx: BankTx = {
+        id: this.id(s, "t"), bankAccountId: bank.id, accountIban: bank.iban, externalId: `HAND-${n}`, bookingDate: input.date, valueDate: input.date,
+        amount: input.amount, balanceAfter: null, counterpartyIban: iban, counterpartyName: input.counterpartyName.trim() || null,
+        description: input.description.trim(), importedAt: this.now(), manual: true, matchedExternalId: null,
+      };
+      s.bankTransactions.push(tx);
+      this.post(s, bankTransactionImported({ tx: { id: tx.id, date: tx.bookingDate, amount: tx.amount, description: tx.description || tx.counterpartyName || "Banktransactie" }, bankLedgerAccountId: bank.ledgerAccountId }), actor);
+      if (iban && s.bankAccounts.some((b) => b.iban === iban && b.id !== bank.id)) {
+        this.assignIn(s, tx.id, [{ kind: "internal", amount: tx.amount }], actor, { isAutomatic: true });
+      }
+      this.audit(s, actor, "bank.manual", { id: tx.id, amount: tx.amount, date: tx.bookingDate, counterparty: tx.counterpartyName });
+      return tx.id;
+    });
   }
 
   recordCash(input: { date: LocalDate; amount: Cents; description: string }, actor: Actor): string {
@@ -724,36 +960,75 @@ export class LedgerStore {
     for (const p of s.parties) for (const i of p.ibans) partyByIban.set(i, { id: p.id, name: p.name });
     const lastByCounterparty = new Map<string, { target: SuggestionTarget; label: string }>();
     const txById = new Map(s.bankTransactions.map((t) => [t.id, t]));
+    const contributionAccount = d.accountByKey.get("CONTRIBUTION_RECEIVABLE")?.id;
+    const savingsAccount = d.accountByKey.get("MEMBER_SAVINGS")?.id;
     for (const e of s.entries) {
       if (e.sourceType !== "bank_transaction" || e.template === "T00" || e.template === "T19" || e.reversesEntryId || d.reversedIds.has(e.id)) continue;
       const btx = e.sourceId ? txById.get(e.sourceId) : undefined;
-      if (!btx?.counterpartyIban || btx.id === tx.id) continue;
+      if (!btx?.counterpartyIban || btx.id === tx.id || Math.sign(btx.amount) !== Math.sign(tx.amount)) continue;
       const targets = e.lines.filter((l) => d.accountById.get(l.accountId)?.systemKey !== "BANK_SUSPENSE");
       if (targets.length !== 1) continue;
       const t = targets[0];
+      const name = t.partyId ? d.partyById.get(t.partyId)?.name ?? "" : "";
       let target: SuggestionTarget | null = null;
       let label = "";
-      if (t.partyId) { target = { kind: "person", partyId: t.partyId }; label = d.partyById.get(t.partyId)?.name ?? ""; }
-      else if (t.activityId) { target = { kind: "activity", activityId: t.activityId }; label = s.activities.find((a) => a.id === t.activityId)?.name ?? ""; }
+      if (t.partyId && t.accountId === contributionAccount) { target = { kind: "contribution", partyId: t.partyId }; label = `contributie van ${name}`; }
+      else if (t.partyId && t.accountId === savingsAccount && t.savingsGoalId) { target = { kind: "savings", partyId: t.partyId, goalId: t.savingsGoalId }; label = `spaarplan ${s.savingsGoals.find((g) => g.id === t.savingsGoalId)?.name} van ${name}`; }
+      else if (t.partyId) { target = { kind: "person", partyId: t.partyId }; label = `rekening van ${name}`; }
+      else if (t.activityId) { const a = s.activities.find((x) => x.id === t.activityId); target = { kind: "activity", activityId: t.activityId }; label = `${a?.number} ${a?.name}`; }
       else if (t.potId) { target = { kind: "pot", potId: t.potId }; label = `potje ${d.potById.get(t.potId)?.name}`; }
       if (target) lastByCounterparty.set(btx.counterpartyIban, { target, label });
     }
     const bank = s.bankAccounts.find((b) => b.id === tx.bankAccountId);
-    return suggestAssignment(tx, {
+    const out = suggestAssignment(tx, {
       ownIbans: s.bankAccounts.map((b) => b.iban).filter((x): x is string => !!x),
       thisAccountIban: bank?.iban ?? null,
       partyByIban,
       lastByCounterparty,
     }).filter((sg) => sg.target.kind !== "activity" || s.activities.find((a) => a.id === (sg.target as { activityId: string }).activityId)?.status === "open");
+
+    // The description says what it is ("spaarplan", "contributie"): suggest that for the known member.
+    if (tx.amount > 0) {
+      const member = out.map((o) => ("partyId" in o.target ? d.partyById.get(o.target.partyId) : undefined)).find((p) => p?.kind === "member");
+      const goal = s.savingsGoals.find((g) => g.active && (tx.description.toLowerCase().includes(g.name.toLowerCase().split(" ")[0]) || /spaar|sparen/i.test(tx.description)));
+      if (member && goal && /spaar|sparen|lustrum|reis/i.test(tx.description) && !out.some((o) => o.target.kind === "savings")) {
+        out.unshift({ reason: "same_as_last", label: `Spaarplan ${goal.name} van ${member.name} (omschrijving)`, target: { kind: "savings", partyId: member.id, goalId: goal.id }, autoBook: false });
+      } else if (member && /contributie/i.test(tx.description) && !out.some((o) => o.target.kind === "contribution")) {
+        out.unshift({ reason: "contribution", label: `Contributie van ${member.name} (omschrijving)`, target: { kind: "contribution", partyId: member.id }, autoBook: false });
+      }
+    }
+    // A member paying exactly their open contribution or a whole number of months: suggest contribution first.
+    if (tx.amount > 0 && !out.some((o) => o.target.kind === "savings" && out.indexOf(o) === 0)) {
+      for (const sg of [...out]) {
+        if (sg.target.kind !== "person") continue;
+        const party = d.partyById.get(sg.target.partyId);
+        const type = party?.member ? s.memberTypes.find((t) => t.id === party.member!.memberTypeId) : null;
+        if (!party || !type || type.monthly <= 0) continue;
+        const open = d.contributionBalance.get(party.id) ?? 0;
+        if (out.some((o) => o.target.kind === "contribution" && o.target.partyId === party.id)) break;
+        if (tx.amount === open || tx.amount % type.monthly === 0) {
+          const months = tx.amount / type.monthly;
+          const label = `Contributie van ${party.name}${Number.isInteger(months) ? ` (${months} ${months === 1 ? "maand" : "maanden"})` : ""}`;
+          out.splice(out.indexOf(sg), 0, { reason: "contribution", label, target: { kind: "contribution", partyId: party.id }, autoBook: false });
+          break;
+        }
+      }
+    }
+    return out;
   }
 
   /** Resolve the UI's simple target description into an AssignmentTarget. */
-  buildTarget(s: State, t: { kind: "person" | "activity" | "pot" | "internal"; id?: string; amount: Cents; description?: string }): AssignmentTarget {
+  buildTarget(s: State, t: AssignPart): AssignmentTarget {
     if (t.kind === "internal") return { kind: "internal", amount: t.amount };
-    if (t.kind === "person") {
+    if (t.kind === "person" || t.kind === "contribution" || t.kind === "savings") {
       const p = s.parties.find((x) => x.id === t.id);
       if (!p) throw new LedgerError("Kies een persoon");
-      return { kind: "person", partyId: p.id, partyKind: p.kind, amount: t.amount, description: t.description };
+      if (t.kind === "person") return { kind: "person", partyId: p.id, partyKind: p.kind, amount: t.amount, description: t.description };
+      if (p.kind !== "member") throw new LedgerError(t.kind === "contribution" ? "Alleen leden betalen contributie" : "Alleen leden hebben een spaarplan");
+      if (t.kind === "contribution") return { kind: "contribution", partyId: p.id, amount: t.amount, description: t.description };
+      const goal = s.savingsGoals.find((g) => g.id === t.goalId);
+      if (!goal) throw new LedgerError("Kies een spaardoel");
+      return { kind: "savings", partyId: p.id, goalId: goal.id, amount: t.amount, description: t.description };
     }
     if (t.kind === "activity") {
       if (!s.activities.some((a) => a.id === t.id)) throw new LedgerError("Kies een activiteit");
@@ -761,10 +1036,11 @@ export class LedgerStore {
     }
     const pot = s.pots.find((p) => p.id === t.id);
     if (!pot) throw new LedgerError("Kies een potje");
-    return { kind: "pot", potId: pot.id, accountId: t.amount > 0 ? pot.incomeAccountId : pot.expenseAccountId, amount: t.amount, description: t.description };
+    if (t.donorId && !s.parties.some((p) => p.id === t.donorId)) throw new LedgerError("Onbekende gever");
+    return { kind: "pot", potId: pot.id, accountId: t.amount > 0 ? pot.incomeAccountId : pot.expenseAccountId, amount: t.amount, description: t.description, relatedPartyId: t.donorId ?? null };
   }
 
-  assign(txId: string, parts: { kind: "person" | "activity" | "pot" | "internal"; id?: string; amount: Cents; description?: string }[], actor: Actor, opts: { rememberIbanFor?: string | null } = {}) {
+  assign(txId: string, parts: AssignPart[], actor: Actor, opts: { rememberIbanFor?: string | null } = {}) {
     require(actor, "edit");
     this.transact((s) => {
       const targets = parts.map((p) => this.buildTarget(s, p));
@@ -778,6 +1054,15 @@ export class LedgerStore {
           this.audit(s, actor, "party.iban.add", { partyId: party.id, iban });
         }
       }
+    });
+  }
+
+  /** Assign several transactions at once (e.g. all contribution payments), each as one target. */
+  assignMany(items: { txId: string; part: AssignPart }[], actor: Actor): number {
+    require(actor, "edit");
+    return this.transact((s) => {
+      for (const it of items) this.assignIn(s, it.txId, [this.buildTarget(s, it.part)], actor, {});
+      return items.length;
     });
   }
 
@@ -816,7 +1101,9 @@ export class LedgerStore {
   }
   private chargeMonth(s: State, monthInput: LocalDate, actor: Actor): number {
     const month = firstOfMonth(monthInput);
-    const pot = s.pots.find((p) => p.code === "CONTRIBUTIE")!;
+    const income = s.accounts.find((a) => a.systemKey === "CONTRIBUTION")!;
+    const split = s.settings.contributionKey.filter((k) => k.weight > 0);
+    if (!split.length) throw new LedgerError("Stel eerst de verdeling van de contributie over de potjes in");
     let n = 0;
     for (const p of s.parties) {
       const m = p.member;
@@ -824,7 +1111,7 @@ export class LedgerStore {
       if (s.contributionMonths.some((c) => c.memberId === p.id && c.month === month)) continue;
       const type = s.memberTypes.find((t) => t.id === m.memberTypeId)!;
       if (type.monthly === 0) continue;
-      const entry = this.post(s, contributionCharged({ chargeId: `${p.id}:${month}`, partyId: p.id, month, amount: type.monthly, potId: pot.id, incomeAccountId: pot.incomeAccountId, description: `Contributie ${formatMonthNl(month)} (${type.name})` }), actor);
+      const entry = this.post(s, contributionCharged({ chargeId: `${p.id}:${month}`, partyId: p.id, month, amount: type.monthly, incomeAccountId: income.id, split, description: `Contributie ${formatMonthNl(month)} (${type.name})` }), actor);
       s.contributionMonths.push({ memberId: p.id, month, entryId: entry.id });
       n++;
     }
@@ -839,7 +1126,7 @@ export class LedgerStore {
     return this.transact((s) => {
       if (!input.name.trim()) throw new LedgerError("Naam is verplicht");
       if (!s.pots.some((p) => p.id === input.potId)) throw new LedgerError("Kies een potje");
-      const a: Activity = { id: this.id(s, "act"), name: input.name.trim(), heldOn: input.heldOn, potId: input.potId, status: "open", settlementEntryId: null, createdAt: this.now() };
+      const a: Activity = { id: this.id(s, "act"), number: this.nextActivityNumber(s, input.heldOn ?? localDate(this.now().slice(0, 10))), name: input.name.trim(), heldOn: input.heldOn, potId: input.potId, status: "open", settlementEntryId: null, createdAt: this.now() };
       s.activities.push(a);
       this.audit(s, actor, "activity.create", a);
       return a;
@@ -1006,14 +1293,151 @@ export class LedgerStore {
     });
   }
 
-  setBudget(input: Budget, actor: Actor) {
+  addBudgetLine(input: Omit<BudgetLine, "id">, actor: Actor): BudgetLine {
+    require(actor, "admin");
+    return this.transact((s) => {
+      if (input.amount < 0) throw new LedgerError("Een begrotingsbedrag kan niet negatief zijn; kies baten of lasten");
+      if (!s.pots.some((p) => p.id === input.potId)) throw new LedgerError("Kies een potje");
+      if (!input.description.trim()) throw new LedgerError("Omschrijving is verplicht");
+      const line: BudgetLine = { ...input, description: input.description.trim(), id: this.id(s, "bl") };
+      s.budgets.push(line);
+      this.audit(s, actor, "budget.add", line);
+      return line;
+    });
+  }
+
+  updateBudgetLine(id: string, input: Partial<Omit<BudgetLine, "id" | "fiscalYearId">>, actor: Actor) {
     require(actor, "admin");
     this.transact((s) => {
-      if (input.amount < 0) throw new LedgerError("Begroting kan niet negatief zijn");
-      const existing = s.budgets.find((b) => b.fiscalYearId === input.fiscalYearId && b.potId === input.potId && b.kind === input.kind);
-      if (existing) existing.amount = input.amount;
-      else s.budgets.push({ ...input });
-      this.audit(s, actor, "budget.set", input);
+      const line = s.budgets.find((b) => b.id === id);
+      if (!line) throw new LedgerError("Begrotingsregel niet gevonden");
+      if (input.amount !== undefined && input.amount < 0) throw new LedgerError("Een begrotingsbedrag kan niet negatief zijn");
+      this.audit(s, actor, "budget.update", { id, before: { ...line }, after: input });
+      Object.assign(line, input);
+    });
+  }
+
+  removeBudgetLine(id: string, actor: Actor) {
+    require(actor, "admin");
+    this.transact((s) => {
+      const i = s.budgets.findIndex((b) => b.id === id);
+      if (i < 0) throw new LedgerError("Begrotingsregel niet gevonden");
+      this.audit(s, actor, "budget.remove", s.budgets[i]);
+      s.budgets.splice(i, 1);
+    });
+  }
+
+  /** Fill a year's budget from last year's budget or last year's actual figures (per pot). */
+  copyBudget(fromFyId: string, toFyId: string, mode: "budget" | "actual", actor: Actor): number {
+    require(actor, "admin");
+    return this.transact((s) => {
+      const from = s.fiscalYears.find((f) => f.id === fromFyId);
+      if (!from || !s.fiscalYears.some((f) => f.id === toFyId)) throw new LedgerError("Onbekend boekjaar");
+      let n = 0;
+      if (mode === "budget") {
+        for (const b of s.budgets.filter((x) => x.fiscalYearId === fromFyId)) {
+          s.budgets.push({ ...b, id: this.id(s, "bl"), fiscalYearId: toFyId });
+          n++;
+        }
+      } else {
+        for (const [potId, r] of resultByPot(s, from)) {
+          if (r.income > 0) { s.budgets.push({ id: this.id(s, "bl"), fiscalYearId: toFyId, potId, kind: "income", description: `Realisatie ${from.label}`, amount: cents(r.income) }); n++; }
+          if (r.expense > 0) { s.budgets.push({ id: this.id(s, "bl"), fiscalYearId: toFyId, potId, kind: "expense", description: `Realisatie ${from.label}`, amount: cents(r.expense) }); n++; }
+        }
+      }
+      this.audit(s, actor, "budget.copy", { from: fromFyId, to: toFyId, mode, lines: n });
+      return n;
+    });
+  }
+
+  createPot(input: { name: string; kind: "expense" | "income" | "both" }, actor: Actor): Pot {
+    require(actor, "admin");
+    return this.transact((s) => {
+      const name = input.name.trim();
+      if (!name) throw new LedgerError("Naam is verplicht");
+      if (s.pots.some((p) => p.name.toLowerCase() === name.toLowerCase())) throw new LedgerError("Dit potje bestaat al");
+      const general = s.pots.find((p) => p.code === "ALGEMEEN")!;
+      const pot: Pot = { id: this.id(s, "p"), code: name.toUpperCase().replace(/[^A-Z0-9]+/g, "_"), name, incomeAccountId: general.incomeAccountId, expenseAccountId: general.expenseAccountId };
+      s.pots.push(pot);
+      this.audit(s, actor, "pot.create", pot);
+      return pot;
+    });
+  }
+
+  setContributionKey(key: { potId: string; weight: number }[], actor: Actor) {
+    require(actor, "admin");
+    this.transact((s) => {
+      const clean = key.filter((k) => k.weight > 0);
+      if (!clean.length) throw new LedgerError("Kies minimaal één potje");
+      for (const k of clean) {
+        if (!Number.isInteger(k.weight) || k.weight < 0) throw new LedgerError("Gebruik hele getallen (bijv. procenten)");
+        if (!s.pots.some((p) => p.id === k.potId)) throw new LedgerError("Onbekend potje");
+      }
+      if (new Set(clean.map((k) => k.potId)).size !== clean.length) throw new LedgerError("Elk potje mag maar één keer voorkomen");
+      this.audit(s, actor, "contribution.key", { before: s.settings.contributionKey, after: clean });
+      s.settings.contributionKey = clean;
+    });
+  }
+
+  // -- savings plans (spaarplannen) -----------------------------------------------
+
+  createSavingsGoal(input: { name: string; targetDate: LocalDate | null; monthly: Cents }, actor: Actor): SavingsGoal {
+    require(actor, "admin");
+    return this.transact((s) => {
+      if (!input.name.trim()) throw new LedgerError("Naam is verplicht");
+      if (input.monthly < 0) throw new LedgerError("Maandbedrag kan niet negatief zijn");
+      const g: SavingsGoal = { id: this.id(s, "g"), name: input.name.trim(), targetDate: input.targetDate, monthly: input.monthly, active: true };
+      s.savingsGoals.push(g);
+      this.audit(s, actor, "savings.goal.create", g);
+      return g;
+    });
+  }
+
+  updateSavingsGoal(id: string, input: { name: string; targetDate: LocalDate | null; monthly: Cents; active: boolean }, actor: Actor) {
+    require(actor, "admin");
+    this.transact((s) => {
+      const g = s.savingsGoals.find((x) => x.id === id);
+      if (!g) throw new LedgerError("Spaardoel niet gevonden");
+      this.audit(s, actor, "savings.goal.update", { before: { ...g }, after: input });
+      Object.assign(g, { ...input, name: input.name.trim() });
+    });
+  }
+
+  /**
+   * Use savings to pay what members owe: moves money from their savings (goal) to their account.
+   * `amount` per member; use `settleSavingsForGoal` to do this for everyone at once.
+   */
+  settleSavings(input: { partyId: string; goalId: string; amount: Cents; date: LocalDate }, actor: Actor) {
+    require(actor, "approve");
+    this.transact((s) => this.settleSavingsIn(s, input, actor));
+  }
+  private settleSavingsIn(s: State, input: { partyId: string; goalId: string; amount: Cents; date: LocalDate }, actor: Actor) {
+    const goal = s.savingsGoals.find((g) => g.id === input.goalId);
+    if (!goal) throw new LedgerError("Spaardoel niet gevonden");
+    const saved = this.dv(s).savings.get(`${input.partyId}|${goal.id}`) ?? 0;
+    if (input.amount <= 0) throw new LedgerError("Bedrag moet positief zijn");
+    if (input.amount > saved) throw new LedgerError(`Er is maar ${formatEuro(cents(saved))} gespaard`);
+    this.post(s, savingsSettled({ partyId: input.partyId, goalId: goal.id, goalName: goal.name, date: input.date, amount: input.amount }), actor);
+  }
+
+  /** For every member: use savings for this goal to pay their open balance (never more than saved). */
+  settleSavingsForGoal(goalId: string, date: LocalDate, mode: "owed" | "all", actor: Actor): { members: number; total: Cents } {
+    require(actor, "approve");
+    return this.transact((s) => {
+      const d = this.dv(s);
+      let members = 0;
+      let total = 0;
+      for (const p of s.parties.filter((x) => x.kind === "member")) {
+        const saved = d.savings.get(`${p.id}|${goalId}`) ?? 0;
+        if (saved <= 0) continue;
+        const owed = d.partyBalance.get(p.id) ?? 0;
+        const amount = mode === "all" ? saved : Math.min(saved, Math.max(0, owed));
+        if (amount <= 0) continue;
+        this.settleSavingsIn(s, { partyId: p.id, goalId, amount: cents(amount), date }, actor);
+        members++;
+        total += amount;
+      }
+      return { members, total: cents(total) };
     });
   }
 
@@ -1094,8 +1518,12 @@ export class LedgerStore {
     const total = sum(s.entries.flatMap((e) => e.lines.map((l) => l.amount)));
     const unbalanced = s.entries.filter((e) => sum(e.lines.map((l) => l.amount)) !== 0).length;
     const bankChecks = s.bankAccounts.filter((b) => b.kind !== "cash").map((b) => {
-      const last = s.bankTransactions.filter((t) => t.bankAccountId === b.id && t.balanceAfter !== null).at(-1);
-      const ledger = d.bankBalance.get(b.id) ?? 0;
+      const txs = s.bankTransactions.filter((t) => t.bankAccountId === b.id);
+      const order = (t: BankTx) => Number(t.matchedExternalId ?? t.externalId) || 0;
+      const last = txs.filter((t) => t.balanceAfter !== null).sort((a, b) => (a.bookingDate === b.bookingDate ? order(a) - order(b) : a.bookingDate < b.bookingDate ? -1 : 1)).at(-1);
+      // Hand-entered transactions not yet confirmed by a bank file come on top of the bank's last saldo.
+      const pendingManual = sum(txs.filter((t) => t.manual && !t.matchedExternalId).map((t) => t.amount));
+      const ledger = (d.bankBalance.get(b.id) ?? 0) - pendingManual;
       return { b, ok: !last || last.balanceAfter === ledger, ledger, bank: last?.balanceAfter ?? null };
     });
     let prev: string | null = null;
@@ -1116,6 +1544,13 @@ export class LedgerStore {
       { label: "Journaalnummers lopen zonder gaten", ok: numbering, detail: "" },
       { label: "Logboek is niet gewijzigd (hash-keten klopt)", ok: brokenAt === null, detail: brokenAt === null ? `${s.audit.length} regels` : `gebroken bij regel ${brokenAt}` },
     ];
+  }
+
+  private nextActivityNumber(s: State, date: LocalDate): string {
+    const fy = fiscalYearFor(date, s.settings.fiscalYearStartMonth);
+    const prefix = `A${fy.startDate.slice(2, 4)}-`;
+    const used = s.activities.filter((a) => a.number?.startsWith(prefix)).map((a) => Number(a.number.slice(prefix.length)));
+    return `${prefix}${String((used.length ? Math.max(...used) : 0) + 1).padStart(3, "0")}`;
   }
 
   // -- demo helpers (used by the demo generator only) --------------------------

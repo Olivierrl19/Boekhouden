@@ -222,7 +222,7 @@ describe("closing a fiscal year", () => {
     const next = await db.transaction((tx) => ensureFiscalYear(tx, localDate("2027-08-01"), SYSTEM));
     const nextBalances = await accountBalances(db, next);
     expect(nextBalances.find((a) => a.code === "1000")!.balance).toBe(100000);
-    expect(nextBalances.find((a) => a.code === "1300")!.balance).toBe(3000);
+    expect(nextBalances.find((a) => a.code === "1305")!.balance).toBe(3000);
 
     await db.transaction((tx) => reopenFiscalYear(tx, fy.id, "Correctie kascommissie", SYSTEM));
     const reopened = await fiscalYearById(db, fy.id);

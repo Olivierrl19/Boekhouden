@@ -116,3 +116,128 @@ describe("contribution", () => {
     expect(store.chargeContributions(localDate("2026-09-01"), BESTUUR)).toBe(0); // already done by the demo
   });
 });
+
+import { contributionOverview, donationsByGiver, migrateState, resultByPot, type State } from "./ledger";
+import { rabobankAmount, toRabobankCsv } from "@/domain/bank/rabobank-csv";
+
+function freshStore() {
+  const store = new LedgerStore(
+    LedgerStore.install({ name: "Test", fiscalYearStartMonth: 8, startDate: localDate("2026-08-01"), checkingIban: "NL91RABO0315273637", savingsIban: null }),
+  );
+  const type = store.createMemberType({ name: "Lid", monthly: cents(1500) }, FISCUS);
+  const jan = store.createMember({ firstName: "Jan", lastName: "Jansen", memberTypeId: type.id, joinedOn: localDate("2026-08-01"), ibans: ["NL20INGB0001234567"] }, FISCUS);
+  return { store, jan, type };
+}
+const csv = (rows: { volgnr: number; date: string; amount: number; balance: number; iban?: string; name?: string; desc?: string }[]) =>
+  parseRabobankCsv(toRabobankCsv(rows.map((r) => ({ iban: "NL91RABO0315273637", volgnr: r.volgnr, date: r.date, amount: rabobankAmount(r.amount), balanceAfter: rabobankAmount(r.balance), counterpartyIban: r.iban, counterpartyName: r.name, description: r.desc }))));
+
+describe("contribution per member", () => {
+  it("divides contribution income over pots with the key and shows who paid which month", () => {
+    const { store, jan } = freshStore();
+    const s0 = store.getState();
+    const pot = (code: string) => s0.pots.find((p) => p.code === code)!.id;
+    store.setContributionKey([{ potId: pot("HUISVESTING"), weight: 60 }, { potId: pot("RESERVERINGEN"), weight: 40 }], FISCUS);
+    for (const m of ["2026-08-01", "2026-09-01", "2026-10-01"]) store.chargeContributions(localDate(m), FISCUS);
+    const fy = store.getState().fiscalYears[0];
+    const byPot = resultByPot(store.getState(), fy);
+    expect(byPot.get(pot("HUISVESTING"))!.income).toBe(2700);
+    expect(byPot.get(pot("RESERVERINGEN"))!.income).toBe(1800);
+
+    // Jan pays one and a half months: August paid, September partly, October open.
+    store.importTransactions(csv([{ volgnr: 1, date: "2026-10-05", amount: 2250, balance: 2250, iban: "NL20INGB0001234567", name: "Jan", desc: "Contributie" }]), FISCUS);
+    const tx = derive(store.getState()).unassigned[0];
+    // 22,50 is not a whole number of months, but the description says "Contributie"
+    expect(store.suggestions(tx.id)[0]).toMatchObject({ reason: "contribution", label: expect.stringContaining("omschrijving") });
+    store.assign(tx.id, [{ kind: "contribution", id: jan.id, amount: tx.amount }], FISCUS);
+    const row = contributionOverview(store.getState(), fy).rows.find((r) => r.party.id === jan.id)!;
+    expect([...row.months.values()].map((m) => m.status)).toEqual(["paid", "partial", "open"]);
+    expect(row.open).toBe(2250);
+    // contribution is separate from the member's current account
+    expect(derive(store.getState()).partyBalance.get(jan.id) ?? 0).toBe(0);
+  });
+
+  it("suggests contribution when a member pays a whole number of months, and assigns in bulk", () => {
+    const { store, jan } = freshStore();
+    store.chargeContributions(localDate("2026-09-01"), FISCUS);
+    store.importTransactions(csv([{ volgnr: 1, date: "2026-09-03", amount: 3000, balance: 3000, iban: "NL20INGB0001234567", name: "Jan" }]), FISCUS);
+    const tx = derive(store.getState()).unassigned[0];
+    expect(store.suggestions(tx.id)[0]).toMatchObject({ reason: "contribution", target: { kind: "contribution", partyId: jan.id } });
+    store.assignMany([{ txId: tx.id, part: { kind: "contribution", id: jan.id, amount: tx.amount } }], BESTUUR);
+    expect(derive(store.getState()).contributionBalance.get(jan.id)).toBe(-1500); // one month paid ahead
+  });
+});
+
+describe("savings plans", () => {
+  it("keeps savings apart and settles them against what a member owes", () => {
+    const { store, jan } = freshStore();
+    const goal = store.createSavingsGoal({ name: "Lustrumreis", targetDate: null, monthly: cents(2000) }, FISCUS);
+    store.importTransactions(csv([{ volgnr: 1, date: "2026-09-01", amount: 5000, balance: 5000, iban: "NL20INGB0001234567", name: "Jan", desc: "sparen" }]), FISCUS);
+    const tx = derive(store.getState()).unassigned[0];
+    store.assign(tx.id, [{ kind: "savings", id: jan.id, goalId: goal.id, amount: tx.amount }], FISCUS);
+    expect(derive(store.getState()).savings.get(`${jan.id}|${goal.id}`)).toBe(5000);
+    const trip = store.createActivity({ name: "Reis", heldOn: localDate("2026-10-01"), potId: store.getState().pots[0].id }, FISCUS);
+    store.chargePerson({ partyId: jan.id, date: localDate("2026-10-01"), amount: cents(3500), target: { kind: "activity", id: trip.id }, description: "Reis" }, FISCUS);
+    const r = store.settleSavingsForGoal(goal.id, localDate("2026-10-02"), "owed", FISCUS);
+    expect(r).toEqual({ members: 1, total: 3500 });
+    const d = derive(store.getState());
+    expect(d.partyBalance.get(jan.id)).toBe(0);
+    expect(d.savings.get(`${jan.id}|${goal.id}`)).toBe(1500);
+    expect(() => store.settleSavings({ partyId: jan.id, goalId: goal.id, amount: cents(2000), date: localDate("2026-10-02") }, FISCUS)).toThrow(/maar/);
+    expect(store.verify().every((c) => c.ok)).toBe(true);
+  });
+});
+
+describe("manual bank transactions", () => {
+  it("are linked to the bank file later instead of being booked twice", () => {
+    const { store, jan } = freshStore();
+    const id = store.addManualBankTransaction({ bankAccountId: store.getState().bankAccounts[0].id, date: localDate("2026-09-02"), amount: cents(1500), counterpartyName: "Jan", counterpartyIban: "NL20INGB0001234567", description: "contributie" }, BESTUUR);
+    store.assign(id, [{ kind: "contribution", id: jan.id, amount: cents(1500) }], BESTUUR);
+    expect(store.verify().every((c) => c.ok)).toBe(true);
+    const result = store.importTransactions(csv([
+      { volgnr: 1, date: "2026-09-01", amount: -1250, balance: -1250, name: "Rabobank" },
+      { volgnr: 2, date: "2026-09-03", amount: 1500, balance: 250, iban: "NL20INGB0001234567", name: "Jan" },
+    ]), BESTUUR);
+    expect(result).toMatchObject({ added: 1, duplicates: 1 });
+    expect(store.getState().bankTransactions.find((t) => t.id === id)!.matchedExternalId).toBe("2");
+    expect(derive(store.getState()).bankBalance.get(store.getState().bankAccounts[0].id)).toBe(250);
+    expect(store.verify().every((c) => c.ok)).toBe(true);
+  });
+
+  it("refuses an import when a hand-entered transaction is missing from the bank file", () => {
+    const { store } = freshStore();
+    store.addManualBankTransaction({ bankAccountId: store.getState().bankAccounts[0].id, date: localDate("2026-09-02"), amount: cents(999), counterpartyName: "Fout", counterpartyIban: null, description: "" }, BESTUUR);
+    expect(() => store.importTransactions(csv([{ volgnr: 1, date: "2026-09-05", amount: 500, balance: 500 }]), BESTUUR)).toThrow(/niet in het bankbestand/);
+  });
+});
+
+describe("activities, donations and old backups", () => {
+  it("numbers activities per fiscal year", () => {
+    const { store } = freshStore();
+    const pot = store.getState().pots[0].id;
+    expect(store.createActivity({ name: "a", heldOn: localDate("2026-09-01"), potId: pot }, FISCUS).number).toBe("A26-001");
+    expect(store.createActivity({ name: "b", heldOn: localDate("2026-10-01"), potId: pot }, FISCUS).number).toBe("A26-002");
+    expect(store.createActivity({ name: "c", heldOn: localDate("2027-09-01"), potId: pot }, FISCUS).number).toBe("A27-001");
+  });
+
+  it("records who donated", () => {
+    const { store, jan } = freshStore();
+    const donations = store.getState().pots.find((p) => p.code === "DONATIES")!;
+    store.importTransactions(csv([{ volgnr: 1, date: "2026-09-01", amount: 5000, balance: 5000, name: "Jan" }]), FISCUS);
+    store.assign(derive(store.getState()).unassigned[0].id, [{ kind: "pot", id: donations.id, donorId: jan.id, amount: cents(5000) }], FISCUS);
+    expect(donationsByGiver(store.getState(), store.getState().fiscalYears[0])).toEqual([{ partyId: jan.id, amount: 5000 }]);
+    expect(derive(store.getState()).partyBalance.get(jan.id) ?? 0).toBe(0);
+  });
+
+  it("upgrades a version-1 backup", () => {
+    const v1 = structuredClone(demoStore().getState()) as unknown as Record<string, unknown> & State;
+    // simulate an old backup
+    (v1 as unknown as { version: number }).version = 1;
+    v1.accounts = v1.accounts.filter((a) => a.code !== "1305" && a.code !== "1740");
+    (v1 as unknown as { budgets: unknown[] }).budgets = [];
+    for (const a of v1.activities) delete (a as { number?: string }).number;
+    const upgraded = migrateState(v1);
+    expect(upgraded.version).toBe(2);
+    expect(upgraded.accounts.some((a) => a.systemKey === "MEMBER_SAVINGS")).toBe(true);
+    expect(upgraded.activities.every((a) => /^A\d\d-\d{3}$/.test(a.number))).toBe(true);
+  });
+});

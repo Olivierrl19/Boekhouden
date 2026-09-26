@@ -20,6 +20,9 @@ export const SYSTEM_KEYS = [
   "RESERVE_DOTATION",
   "RESERVE_WITHDRAWAL",
   "CONTRIBUTION",
+  "CONTRIBUTION_RECEIVABLE",
+  "MEMBER_SAVINGS",
+  "DONATIONS",
 ] as const;
 export type SystemKey = (typeof SYSTEM_KEYS)[number];
 
@@ -57,6 +60,8 @@ export const TEMPLATE_CODES = {
   T28: "Afboeken oninbaar",
   T29: "Memoriaal",
   T31: "Gesplitste toewijzing",
+  T32: "Spaargeld verrekend",
+  T33: "Spaarplan inleg/uitbetaling",
 } as const;
 export type TemplateCode = keyof typeof TEMPLATE_CODES;
 
@@ -68,6 +73,10 @@ export interface LineDraft {
   partyId?: string | null;
   bankTransactionId?: string | null;
   invoiceId?: string | null;
+  /** Savings goal (spaardoel) for lines on the member savings account. */
+  savingsGoalId?: string | null;
+  /** Informational only (e.g. the donor of a donation); never affects person balances. */
+  relatedPartyId?: string | null;
   description?: string | null;
 }
 
