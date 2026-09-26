@@ -1,129 +1,138 @@
 # PLAN — Boekhouding voor een studentendispuut
 
-> Status: **concept, wacht op goedkeuring**. Er wordt geen code geschreven voordat dit plan is goedgekeurd.
-> Open vragen staan in §13. Waar een keuze nog niet vastligt, staat de voorgestelde standaard erbij, gemarkeerd met **[VRAAG n]**.
+> Status: **v2, goedgekeurd met de antwoorden van de opdrachtgever** (zie §13 voor het besluitenlog).
+> v1 bevatte incasso's, open-post-afletteren en een matching engine met confidence-scores. Die zijn na de antwoorden geschrapt of vereenvoudigd: **het systeem moet klein zijn en áltijd kloppen**.
 
 ---
 
-## 0. Samenvatting van het ontwerp
+## 0. Het idee in één alinea
 
-- **Eén dispuut per installatie** (single-tenant). Multi-tenant staat niet in scope; het datamodel blokkeert het niet (alles hangt aan `fiscal_year`).
-- **Het grootboek is de enige plek waar geld "bestaat"**. Alle andere tabellen (declaraties, facturen, contributie, activiteiten) zijn *documenten* die journaalposten veroorzaken. Saldi (banksaldo, ledensaldo, openstaande posten, resultaat per potje) worden **altijd afgeleid** uit de journaalregels, nooit apart bijgehouden.
-- **Elke banktransactie wordt bij import direct geboekt** op de rekening *Te verwerken bankmutaties* (1099). Daardoor klopt het banksaldo in het grootboek **altijd** met de bank, ook als er nog niets is toegewezen. Toewijzen is een tweede journaalpost die het bedrag van 1099 naar de juiste plek verplaatst. *"X transacties nog toe te wijzen"* = aantal banktransacties waarvan het saldo op 1099 ≠ 0. Nul = de boekhouding is bij.
-- **Potjes zijn een dimensie**, geen losse grootboekrekening: elke regel op een resultaatrekening draagt verplicht een `pot_id`. Zo kan "Activiteitsbijdragen" zowel bij potje *Activiteiten* als bij potje *Lustrum* horen, en is begroting-vs-realisatie per potje één query. **[VRAAG 11]**
-- **Saldi zijn cumulatief over boekjaren heen**: er zijn geen "beginbalans"-boekingen per jaar (behalve één keer bij de allereerste start). Balansrekeningen lopen door; resultaatrekeningen worden bij jaarafsluiting naar nul geboekt. Heropenen van een oud jaar werkt daardoor automatisch door in latere jaren, zonder handmatige doorboekingen.
-- **Onveranderlijkheid wordt in de database afgedwongen** (triggers + ontbrekende UPDATE/DELETE-rechten voor de app-rol), niet alleen in de applicatiecode.
+Iedereen (lid of extern) heeft een **eigen rekening** bij het dispuut. Alles wat het dispuut voor iemand voorschiet komt daarop (contributie per maand, een deel van de borrel, een deel van de bierfusten, …); alles wat iemand betaalt of declareert gaat eraf. Wie te veel betaalt heeft een **tegoed**. Uitgaven voor een feest dat nog moet komen staan tot die tijd op **"nog te verdelen"** bij die activiteit; bij het afrekenen wordt het bedrag verdeeld over de deelnemers (en eventueel een deel voor het dispuut zelf, uit een potje). Elke maand krijgt elk lid automatisch een mail met zijn/haar rekening en wat er overgemaakt moet worden. De bank is de bron van waarheid: elke bankregel moet een plek krijgen (*"waar geboekt"*), en het dashboard toont hoeveel er nog openstaan.
+
+Onder de motorkap is het gewoon dubbel boekhouden; in de UI zie je alleen **personen, activiteiten, potjes en de bank**.
 
 ---
 
-## 1. Architectuur
+## 1. Kernprincipes
+
+1. **De bank is de bron van waarheid.** Elke banktransactie wordt bij import direct geboekt op *Te verwerken bankmutaties* (1099). Toewijzen verplaatst het bedrag naar een persoon, activiteit, potje, factuur of interne overboeking. "X transacties nog toe te wijzen" = aantal banktransacties met een saldo ≠ 0 op 1099. Nul = de boekhouding is bij. Daardoor is **banksaldo in de app = banksaldo bij de bank, altijd**, ook vóór het toewijzen.
+2. **Dubbel boekhouden onder de motorkap.** Elke gebeurtenis maakt één journaalpost waarvan de regels op nul sluiten. Debet/credit is alleen zichtbaar in het scherm *Memoriaal* (fiscus) en voor de kascommissie.
+3. **Geboekt = onveranderlijk.** Correcties zijn tegenboekingen. Append-only audit log (wie, wanneer, wat, waarom), met hash-keten. Afgedwongen in de database, niet alleen in code.
+4. **Bedragen zijn integers in eurocenten.** Nooit floats, ook niet bij het parsen van bankbestanden.
+5. **Import is idempotent.** (IBAN + volgnummer) kan nooit twee keer geboekt worden.
+6. **De balans klopt altijd.** Som van alle regels = 0 (dus activa = passiva); grootboeksaldo bank = laatste "saldo na transactie" uit de bankexport; een import die een gat in de saldoketen zou veroorzaken wordt geweigerd.
+7. **Geen gokwerk.** De app boekt nooit iets op basis van een waarschijnlijkheid. Automatisch boeken gebeurt alleen bij zekerheid (overboeking tussen eigen rekeningen, of een regel die de fiscus zelf expliciet op "automatisch" heeft gezet). Al het andere is een voorstel dat met één klik bevestigd wordt.
+
+---
+
+## 2. Architectuur
 
 ```
-Browser (Next.js App Router, RSC + server actions, shadcn/ui, NL-UI)
-   │
-   ▼
-src/app/**            ← routes, pagina's, server actions (dunne laag: auth → Zod → service)
-src/server/services   ← use-cases (importBank, approveClaim, closeActivity, closeFiscalYear …)
-src/domain/**         ← PURE functies: journaalpost-templates, matching, contributie-berekening,
-                         money, kenmerken, SEPA-XML-opbouw, rapport-berekeningen. Geen DB, geen I/O.
-src/server/ledger     ← postEntry(): de énige functie die journaal_entry/journal_line schrijft
-src/server/bank       ← BankConnector-interface + implementaties (rabobank-csv, camt053, later psd2)
-src/server/db         ← Drizzle schema, migraties, SQL-triggers
-src/server/pdf        ← @react-pdf/renderer documenten
-src/server/export     ← exceljs, zip (kascommissie-pakket)
-src/server/storage    ← S3-client (MinIO lokaal)
+src/app/**             routes, pagina's, server actions (auth → Zod → service); NL-UI
+src/components/**      UI (Tailwind + shadcn/ui)
+src/domain/**          PURE functies, geen I/O: money, journaalpost-templates, verdeling
+                       (largest remainder), voorstellen, rapportberekeningen, parsers
+src/server/ledger/     postEntry() / reverseEntry(): de énige code die journaal schrijft
+src/server/services/   use-cases (importBank, assignTransaction, approveClaim, settleActivity, …)
+src/server/bank/       BankConnector-interface + rabobank-csv, camt053 (later psd2)
+src/server/db/         Drizzle-schema, migraties (incl. SQL-triggers), seed
+src/server/auth/       Auth.js-config, rollen, requireRole()
+src/server/pdf|export|mail|storage/
 ```
 
-Regel: **alle geldmutaties lopen via `postEntry()`** binnen één DB-transactie samen met de statuswijziging van het document en de audit-logregel. Lukt één van de drie niet, dan gebeurt er niets.
+Regel: **alle geldmutaties lopen via `postEntry()`** in één DB-transactie samen met de statuswijziging van het document en de audit-logregel.
+
+**Eén dispuut per installatie** (single-tenant). Een nieuw dispuut start zijn eigen installatie (gratis: Vercel Hobby + Neon Free) en doorloopt de **installatiewizard** (§9). Dat houdt de data per dispuut strikt gescheiden en het datamodel simpel.
 
 ---
 
-## 2. Datamodel
+## 3. Datamodel
 
-### 2.1 Conventies
+### 3.1 Conventies
 
 | Onderwerp | Keuze |
 |---|---|
-| Bedragen | `bigint` in eurocenten; in TS een branded `Cents` (`number`, `Number.isSafeInteger` gecontroleerd). Nooit `parseFloat`: bedragstrings worden als string geparsed. Verdelingen (pro rata) met *largest remainder* zodat de som exact klopt. |
-| Teken | Journaalregel `amount_cents`: **positief = debet, negatief = credit**. Som per journaalpost = 0. |
-| Sleutels | `uuid` (v7, tijd-sorteerbaar) voor entiteiten; `bigserial` voor audit log. |
-| Tijd | `timestamptz` voor momenten, `date` voor boekdatum/valutadatum (Europe/Amsterdam). |
-| Soft delete | Bestaat niet voor financiële data. Stamdata (leden, relaties, rekeningen, potjes) krijgt `active boolean`. |
-| Btw-voorbereiding | `journal_line.vat_code` en `account.default_vat_code` (nullable, nu altijd `NULL`). |
+| Bedragen | `bigint` eurocenten; in TS branded `Cents` (veilige integer). Parsen via strings. Verdelen met *largest remainder* zodat de som exact klopt. |
+| Teken | `journal_line.amount_cents`: **positief = debet, negatief = credit**. Som per post = 0. |
+| Persoonsrekening | Saldo > 0 = persoon moet het dispuut betalen; saldo < 0 = tegoed. |
+| Sleutels | `uuid` voor entiteiten; `bigserial` voor audit log. |
+| Tijd | `timestamptz` voor momenten, `date` voor boekdatum. Tijdzone Europe/Amsterdam. |
+| Verwijderen | Financiële data nooit; stamdata krijgt `active`. |
+| Btw | `journal_line.vat_code` en `account.default_vat_code`, nullable, nu altijd `NULL`. |
 
-### 2.2 ERD
+### 3.2 ERD
 
 ```mermaid
 erDiagram
     FISCAL_YEAR ||--o{ JOURNAL_ENTRY : bevat
-    FISCAL_YEAR ||--o{ BUDGET_LINE : heeft
+    FISCAL_YEAR ||--o{ BUDGET_LINE : begroting
     FISCAL_YEAR ||--o{ ROLE_ASSIGNMENT : "rollen per jaar"
-    JOURNAL_ENTRY ||--|{ JOURNAL_LINE : "regels (som = 0)"
+    JOURNAL_ENTRY ||--|{ JOURNAL_LINE : "regels, som = 0"
     JOURNAL_ENTRY |o--o| JOURNAL_ENTRY : "tegenboeking van"
     ACCOUNT ||--o{ JOURNAL_LINE : op
-    POT ||--o{ JOURNAL_LINE : "dimensie"
+    POT ||--o{ JOURNAL_LINE : "dimensie potje"
     POT ||--o{ BUDGET_LINE : begroot
-    POT ||--o{ ACTIVITY : "hoort bij"
-    ACTIVITY ||--o{ JOURNAL_LINE : "dimensie"
-    PARTY ||--o{ JOURNAL_LINE : "subadministratie"
-    OPEN_ITEM ||--o{ JOURNAL_LINE : "afgeletterd door"
-    PARTY ||--o| MEMBER : "is"
-    PARTY ||--o| RELATION : "is"
-    MEMBER ||--o{ MANDATE : heeft
+    ACTIVITY ||--o{ JOURNAL_LINE : "dimensie activiteit"
+    PARTY ||--o{ JOURNAL_LINE : "persoonsrekening"
+    PARTY ||--o| MEMBER : "is lid"
+    PARTY ||--o{ PARTY_IBAN : "bekende IBANs"
+    MEMBER_TYPE ||--o{ MEMBER : "soort lid"
+    MEMBER ||--o{ CONTRIBUTION_CHARGE : "maand-aanslag"
     MEMBER |o--o| APP_USER : "logt in als"
     APP_USER ||--o{ ROLE_ASSIGNMENT : krijgt
-    PARTY ||--o{ OPEN_ITEM : "debiteur/crediteur"
 
     BANK_ACCOUNT ||--o{ BANK_TRANSACTION : bevat
-    BANK_ACCOUNT }o--|| ACCOUNT : "grootboekrekening"
     BANK_IMPORT ||--o{ BANK_TRANSACTION : importeerde
     BANK_TRANSACTION ||--o{ JOURNAL_LINE : "import- en toewijsposten"
-    MATCH_RULE ||--o{ MATCH_SUGGESTION : genereert
-    BANK_TRANSACTION ||--o{ MATCH_SUGGESTION : krijgt
-    CASH_COUNT }o--|| BANK_ACCOUNT : "kas"
+    MATCH_RULE ||--o{ BANK_TRANSACTION : "stelt voor"
+    CASH_COUNT }o--|| BANK_ACCOUNT : kas
 
-    CONTRIBUTION_PERIOD ||--o{ CONTRIBUTION_RATE : tarieven
-    CONTRIBUTION_PERIOD ||--o{ CONTRIBUTION_CHARGE : aanslagen
-    CONTRIBUTION_CHARGE ||--|| OPEN_ITEM : "openstaande post"
-    SEPA_BATCH ||--|{ SEPA_BATCH_ITEM : bevat
-    SEPA_BATCH_ITEM }o--|| OPEN_ITEM : int
-    SEPA_BATCH_ITEM }o--|| MANDATE : "onder mandaat"
-
-    EXPENSE_CLAIM ||--o| OPEN_ITEM : "schuld na goedkeuring"
-    PURCHASE_INVOICE ||--|| OPEN_ITEM : crediteur
+    ACTIVITY ||--o{ ACTIVITY_SHARE : "verdeling"
+    PARTY ||--o{ ACTIVITY_SHARE : deelnemer
+    EXPENSE_CLAIM }o--|| PARTY : indiener
+    EXPENSE_CLAIM }o--o| ACTIVITY : "op activiteit"
+    EXPENSE_CLAIM }o--o| POT : "of op potje"
+    PURCHASE_INVOICE }o--|| PARTY : leverancier
+    SALES_INVOICE }o--|| PARTY : klant
     SALES_INVOICE ||--|{ SALES_INVOICE_LINE : regels
-    SALES_INVOICE ||--|| OPEN_ITEM : debiteur
-    ACTIVITY ||--o{ ACTIVITY_PARTICIPANT : deelnemers
-    ACTIVITY_PARTICIPANT ||--o| OPEN_ITEM : betaalverzoek
-    SETTLEMENT }o--o| JOURNAL_ENTRY : "boeking (indien mutatie)"
-    SETTLEMENT ||--|| ATTACHMENT : "PDF"
+    SETTLEMENT }o--o| JOURNAL_ENTRY : "boeking indien mutatie"
     ATTACHMENT }o--o{ EXPENSE_CLAIM : bon
-    AUDIT_LOG }o--|| APP_USER : door
+    MONTHLY_STATEMENT }o--|| PARTY : "maandmail"
+    AUDIT_LOG }o--o| APP_USER : door
 
+    ORG_SETTINGS {
+        text name
+        text short_name
+        text iban_display "voor betaalinstructie"
+        int fiscal_year_start_month "standaard 8"
+        int statement_day "dag van maandmail, standaard 1"
+        bool statement_auto_send
+        text mail_from
+        bool setup_completed
+    }
     FISCAL_YEAR {
         uuid id PK
-        text label "2025-2026"
+        text label "2026-2027"
         date start_date
         date end_date
-        enum status "planned|open|closing|closed"
-        int next_entry_number "gapless teller"
+        enum status "open|closing|closed"
+        int next_entry_number
     }
     ACCOUNT {
         uuid id PK
-        text code UK "bv. 1300"
+        text code UK
         text name
         enum type "asset|liability|equity|income|expense"
-        text system_key UK "bv. BANK_SUSPENSE, null voor eigen rekeningen"
+        text system_key UK
         bool requires_party
-        bool requires_pot
-        bool manual_posting_allowed "false voor bank/kas/1099/0590"
-        text default_vat_code "altijd null (btw later)"
+        bool requires_activity
+        bool manual_posting_allowed
         bool active
     }
     POT {
         uuid id PK
         text code UK
-        text name "Borrels, Lustrum, ..."
+        text name
         uuid default_income_account_id FK
         uuid default_expense_account_id FK
         bool active
@@ -132,7 +141,6 @@ erDiagram
         uuid id PK
         uuid fiscal_year_id FK
         uuid pot_id FK
-        uuid account_id FK "optioneel, anders pot-niveau"
         enum kind "income|expense"
         bigint amount_cents
         text note
@@ -140,15 +148,15 @@ erDiagram
     JOURNAL_ENTRY {
         uuid id PK
         uuid fiscal_year_id FK
-        text entry_number UK "2025-000123"
+        text entry_number UK "2026-000123"
         date entry_date
-        text template "zie paragraaf 4"
+        text template "T00..T33"
         text description
-        text source_type "bank_transaction|expense_claim|..."
+        text source_type
         uuid source_id
-        uuid reverses_entry_id FK "tegenboeking"
-        bool is_automatic "door matching engine"
-        text reason "verplicht bij memoriaal/tegenboeking"
+        uuid reverses_entry_id FK
+        bool is_automatic
+        text reason
         uuid created_by FK
         timestamptz created_at
     }
@@ -157,60 +165,58 @@ erDiagram
         uuid entry_id FK
         int line_no
         uuid account_id FK
-        bigint amount_cents "+debet / -credit"
-        uuid pot_id FK "verplicht op resultaatrekeningen"
-        uuid activity_id FK
-        uuid party_id FK "verplicht op 1300/1310/1600/1610"
-        uuid open_item_id FK
+        bigint amount_cents "+debet -credit"
+        uuid pot_id FK "verplicht op resultaatrekening"
+        uuid activity_id FK "verplicht op 1350"
+        uuid party_id FK "verplicht op 1300/1310/1600"
         uuid bank_transaction_id FK
+        uuid invoice_id "verkoop- of inkoopfactuur"
         text description
-        text vat_code "null"
+        text vat_code
     }
     PARTY {
         uuid id PK
-        enum kind "member|relation"
-        text display_name
+        enum kind "member|external"
+        text name
         text email
-        text iban
-        text bic
+        bool active
+    }
+    PARTY_IBAN {
+        uuid party_id FK
+        text iban UK
+    }
+    MEMBER_TYPE {
+        uuid id PK
+        text name "zelf aan te maken"
+        bigint monthly_contribution_cents
+        bool active
     }
     MEMBER {
         uuid party_id PK
+        uuid member_type_id FK
         text first_name
         text last_name
-        enum status "aspirant|lid|oud_lid|reunist"
         int cohort "jaargang"
         date joined_on
         date left_on
     }
-    RELATION {
-        uuid party_id PK
-        enum relation_type "supplier|sponsor|landlord|other"
-        text kvk_number
-        text address
-    }
-    MANDATE {
+    CONTRIBUTION_CHARGE {
         uuid id PK
         uuid member_id FK
-        text mandate_ref UK
-        date signed_on
-        text iban
-        enum status "active|revoked|expired"
-        bool first_collection_done "FRST vs RCUR"
-        date last_collected_on "36 mnd inactief = verlopen"
-        text original_iban "voor amendement"
+        date month "eerste dag, UK met member"
+        bigint amount_cents
+        uuid entry_id FK
     }
-    OPEN_ITEM {
+    APP_USER {
         uuid id PK
-        enum direction "receivable|payable"
+        text email UK
         uuid party_id FK
-        uuid account_id FK "1300|1310|1600|1610"
-        text source_type
-        uuid source_id
-        text payment_reference UK "kenmerk"
-        bigint original_cents
-        date due_date
-        enum status "open|partial|settled|written_off|cancelled (cache)"
+    }
+    ROLE_ASSIGNMENT {
+        uuid id PK
+        uuid user_id FK
+        uuid fiscal_year_id FK
+        enum role "fiscus|bestuur|kascommissie"
     }
     BANK_ACCOUNT {
         uuid id PK
@@ -218,194 +224,69 @@ erDiagram
         text name
         enum kind "checking|savings|cash"
         uuid ledger_account_id FK
-        text connector "rabobank_csv|camt053|manual|psd2"
     }
     BANK_IMPORT {
         uuid id PK
-        uuid bank_account_id FK
         text format
         text file_sha256
-        uuid file_attachment_id FK
         int count_new
         int count_duplicate
-        uuid imported_by FK
     }
     BANK_TRANSACTION {
         uuid id PK
         uuid bank_account_id FK
-        text external_id "Volgnr / AcctSvcrRef"
+        text external_id "Volgnr"
         date booking_date
-        date value_date
         bigint amount_cents
-        bigint balance_after_cents "null bij CAMT"
+        bigint balance_after_cents
         text counterparty_iban
         text counterparty_name
-        text description "Omschrijving-1..3 samengevoegd"
-        text end_to_end_id
-        text mandate_ref
-        text payment_reference "Betalingskenmerk"
-        text return_reason "Reden retour"
+        text description
         jsonb raw
-        enum state "unassigned|suggested|auto_assigned|assigned|internal (cache)"
     }
     MATCH_RULE {
         uuid id PK
         text name
-        int priority
-        jsonb conditions "iban, regex, bedragrange, richting, rekening"
-        jsonb action "split-template"
-        numeric confidence
-        enum origin "manual|learned"
-        bool active
-    }
-    MATCH_SUGGESTION {
-        uuid id PK
-        uuid bank_transaction_id FK
-        text matcher "reference|sepa|internal|rule|same_as_last|..."
-        uuid rule_id FK
-        numeric confidence
-        jsonb proposal "concept-journaalpost"
-        enum outcome "pending|accepted|rejected|superseded"
-    }
-    CASH_COUNT {
-        uuid id PK
-        uuid bank_account_id FK
-        date counted_on
-        jsonb denominations
-        bigint counted_cents
-        bigint book_cents
-        uuid difference_entry_id FK
-    }
-    CONTRIBUTION_PERIOD {
-        uuid id PK
-        uuid fiscal_year_id FK
-        text name
-        date start_date
-        date end_date
-    }
-    CONTRIBUTION_RATE {
-        uuid id PK
-        uuid period_id FK
-        enum member_status
-        bigint amount_cents
-    }
-    CONTRIBUTION_CHARGE {
-        uuid id PK
-        uuid period_id FK
-        uuid member_id FK
-        bigint amount_cents
-        uuid open_item_id FK
-        uuid entry_id FK
-    }
-    SEPA_BATCH {
-        uuid id PK
-        text message_id UK
-        date collection_date
-        enum status "draft|generated|uploaded|processed"
-        uuid file_attachment_id FK
-    }
-    SEPA_BATCH_ITEM {
-        uuid id PK
-        uuid batch_id FK
-        uuid open_item_id FK
-        uuid mandate_id FK
-        enum sequence_type "FRST|RCUR"
-        text end_to_end_id UK
-        bigint amount_cents
-        enum status "pending|collected|returned"
-    }
-    EXPENSE_CLAIM {
-        uuid id PK
-        uuid member_id FK
-        uuid fiscal_year_id FK
-        bigint amount_cents
-        uuid pot_id FK
-        uuid activity_id FK
-        text description
-        text payout_iban
-        enum status "submitted|approved|paid|rejected|withdrawn"
-        uuid decided_by FK
-        text rejection_reason
-        uuid open_item_id FK
-    }
-    PURCHASE_INVOICE {
-        uuid id PK
-        uuid relation_id FK
-        text supplier_invoice_number
-        date invoice_date
-        date due_date
-        bigint amount_cents
-        uuid pot_id FK
-        uuid activity_id FK
-        enum status "draft|booked|partial|paid|credited"
-        uuid open_item_id FK
-    }
-    SALES_INVOICE {
-        uuid id PK
-        text invoice_number UK "gapless per jaar"
-        uuid relation_id FK
-        date invoice_date
-        date due_date
-        enum status "draft|sent|partial|paid|credited|written_off"
-        uuid credits_invoice_id FK "creditnota"
-        uuid pdf_attachment_id FK
-        uuid open_item_id FK
-    }
-    SALES_INVOICE_LINE {
-        uuid id PK
-        uuid invoice_id FK
-        text description
-        bigint amount_cents
-        uuid pot_id FK
-        uuid account_id FK
+        text counterparty_iban "exact"
+        text description_contains "exact, hoofdletterongevoelig"
+        enum direction "in|out|both"
+        jsonb target "persoon|activiteit|potje"
+        bool auto_book "alleen als fiscus dit expliciet aanzet"
     }
     ACTIVITY {
         uuid id PK
         uuid fiscal_year_id FK
-        uuid pot_id FK
         text name
         date held_on
-        bigint budget_cents
-        enum status "draft|open|settling|closed"
+        uuid pot_id FK "potje voor dispuutsdeel"
+        enum status "open|settled"
+        uuid settlement_entry_id FK
     }
-    ACTIVITY_PARTICIPANT {
-        uuid id PK
+    ACTIVITY_SHARE {
         uuid activity_id FK
-        uuid member_id FK
-        bigint contribution_cents
-        uuid open_item_id FK
+        uuid party_id FK "null = dispuut zelf"
+        enum method "equal|weight|fixed"
+        int weight "bv. aantal streepjes"
+        bigint fixed_cents
     }
-    SETTLEMENT {
+    EXPENSE_CLAIM {
         uuid id PK
-        enum type "activity|member|committee|board"
-        uuid subject_id
-        date period_start
-        date period_end
-        enum status "draft|submitted|approved|final"
-        jsonb snapshot "bevroren cijfers"
-        uuid pdf_attachment_id FK
+        uuid party_id FK
+        bigint amount_cents
+        uuid activity_id FK
+        uuid pot_id FK
+        text description
+        enum status "submitted|approved|rejected|withdrawn"
+        text rejection_reason
         uuid entry_id FK
     }
-    ATTACHMENT {
+    MONTHLY_STATEMENT {
         uuid id PK
-        text storage_key
-        text sha256
-        text filename
-        text mime
-        bigint size
-        uuid uploaded_by FK
-    }
-    APP_USER {
-        uuid id PK
-        text email UK
-        uuid member_id FK
-    }
-    ROLE_ASSIGNMENT {
-        uuid id PK
-        uuid user_id FK
-        uuid fiscal_year_id FK
-        enum role "treasurer|board|committee_chair|member|audit_committee"
-        uuid pot_id FK "alleen bij committee_chair"
+        uuid party_id FK
+        date month "UK met party"
+        bigint opening_cents
+        bigint closing_cents
+        enum status "draft|sent|held"
     }
     AUDIT_LOG {
         bigint id PK
@@ -413,88 +294,75 @@ erDiagram
         uuid actor_user_id FK
         text action
         text entity_type
-        uuid entity_id
-        jsonb before
-        jsonb after
+        text entity_id
+        jsonb data
         text reason
-        bytea prev_hash
-        bytea hash "hash-keten"
+        text prev_hash
+        text hash
     }
 ```
 
-Niet in het ERD (technisch): Auth.js-tabellen (`account`, `session`, `verification_token`), `attachment_link` (koppelt bijlagen aan willekeurige entiteiten), `org_settings` (naam, incassant-ID, auto-boekdrempel, e-mailafzender), `email_outbox` (herinneringen, idempotent verzonden).
+Niet in het ERD: Auth.js-tabellen (`user`-koppeling, `session`, `verification_token`), `attachment` + `attachment_link`, `purchase_invoice`, `sales_invoice(_line)`, `cash_count`, `settlement`, `email_outbox`.
 
-### 2.3 Invarianten en hoe ze worden afgedwongen
+### 3.3 Invarianten en afdwinging
 
 | # | Invariant | Afdwinging |
 |---|---|---|
-| I1 | Som van regels per journaalpost = 0 | `CONSTRAINT TRIGGER … DEFERRABLE INITIALLY DEFERRED` op `journal_line` + check in `postEntry()` + property-test |
-| I2 | Journaal en audit log zijn onveranderlijk | `BEFORE UPDATE OR DELETE` trigger die altijd faalt op `journal_entry`, `journal_line`, `audit_log`, `bank_transaction` (behalve cache-kolom `state`); app-DB-rol heeft geen `UPDATE/DELETE`-grant op die tabellen |
-| I3 | Alleen boeken in een boekjaar met status `open` (of `closing` voor afsluitingsposten) en met datum binnen dat jaar | Trigger op `journal_entry` |
-| I4 | Resultaatrekening ⇒ `pot_id` verplicht; `requires_party` ⇒ `party_id` verplicht; balansrekening ⇒ geen `pot_id` | Trigger + Zod |
-| I5 | Bank-, kas-, 1099- en 0590-rekeningen alleen via systeemtemplates (niet in memoriaal) | `manual_posting_allowed=false` + check in `postEntry()` |
-| I6 | Dezelfde banktransactie bestaat nooit twee keer | `UNIQUE (bank_account_id, external_id)` + `ON CONFLICT DO NOTHING` |
-| I7 | Grootboeksaldo bankrekening = `balance_after_cents` van de laatste geïmporteerde transactie | Controle bij elke import (weigert bij gat, zie §5.4) + test |
-| I8 | Activa = passiva (incl. resultaat lopend jaar) | Volgt wiskundig uit I1; test op totale balans + property-test na willekeurige gebeurtenisreeks |
-| I9 | Journaalpostnummers gapless per boekjaar | Teller op `fiscal_year` met `SELECT … FOR UPDATE` in dezelfde transactie |
-| I10 | Afgesloten activiteit ⇒ geen nieuwe regels met die `activity_id` | Trigger |
-| I11 | Audit log is manipulatie-evident | `hash = sha256(prev_hash ‖ canonical_json(row))`; kascommissie-scherm verifieert de keten |
+| I1 | Som regels per journaalpost = 0, minstens 2 regels | Deferred constraint trigger + check in `postEntry()` + property-test |
+| I2 | Journaal, audit log en banktransacties zijn onveranderlijk | `BEFORE UPDATE OR DELETE` trigger die altijd faalt |
+| I3 | Boeken alleen in boekjaar `open` (of `closing` voor afsluitposten), datum binnen boekjaar | Trigger |
+| I4 | Resultaatrekening ⇒ potje verplicht; balansrekening ⇒ geen potje; `requires_party` ⇒ persoon; `requires_activity` ⇒ activiteit | Trigger + Zod |
+| I5 | Bank, kas, 1099, 1090 en 0590 alleen via systeemtemplates | `manual_posting_allowed = false`, check in `postEntry()` |
+| I6 | Banktransactie uniek per (rekening, volgnr) | `UNIQUE` + `ON CONFLICT DO NOTHING`; afwijkende inhoud bij zelfde sleutel = harde fout |
+| I7 | Grootboeksaldo bankrekening = `balance_after` laatste transactie | Continuïteitscheck bij import, anders rollback |
+| I8 | Activa = passiva | Volgt uit I1; getest op balansrapport + property-test |
+| I9 | Journaalnummers gapless per boekjaar | Teller op `fiscal_year`, `FOR UPDATE` |
+| I10 | Afgerekende activiteit ⇒ geen nieuwe regels op die activiteit; saldo 1350 van die activiteit = 0 | Trigger + check bij afrekenen |
+| I11 | Audit log manipulatie-evident | `hash = sha256(prev_hash ‖ data)`; verificatie in kascommissie-scherm |
+| I12 | Contributie max. één keer per lid per maand | `UNIQUE (member_id, month)` |
 
 ---
 
-## 3. Rekeningschema (voorgedefinieerd, uitbreidbaar)
+## 4. Rekeningschema (seed; uitbreidbaar via beheer)
 
-Rekeningen met een `system_key` kunnen niet worden verwijderd of van type veranderen; naam wijzigen mag. Eigen rekeningen toevoegen mag binnen de reeksen.
+### 4.1 Balans
 
-### 3.1 Balansrekeningen
-
-| Code | Naam | Type | Systeemsleutel | Partij | Handmatig boeken |
+| Code | Naam | Type | Systeemsleutel | Verplicht | Handmatig |
 |---|---|---|---|---|---|
-| **0 — Eigen vermogen** |||||
 | 0500 | Algemene reserve | equity | `GENERAL_RESERVE` | – | ja |
-| 0510 | Bestemmingsreserve lustrumfonds | equity | – | – | ja |
+| 0510 | Bestemmingsreserve lustrum | equity | – | – | ja |
 | 0520 | Bestemmingsreserve huisfonds | equity | – | – | ja |
 | 0590 | Resultaat boekjaar (afsluitrekening) | equity | `YEAR_RESULT` | – | nee |
-| **1 — Liquide middelen** |||||
-| 1000 | Rabobank betaalrekening | asset | `BANK` (per bankrekening) | – | nee |
-| 1010 | Rabobank spaarrekening | asset | `BANK` | – | nee |
+| 1000 | Betaalrekening | asset | `BANK` | – | nee |
+| 1010 | Spaarrekening | asset | `BANK` | – | nee |
 | 1050 | Kas | asset | `CASH` | – | nee |
 | 1090 | Interne overboekingen onderweg | asset | `INTERNAL_TRANSFER` | – | nee |
 | 1099 | Te verwerken bank- en kasmutaties | asset | `BANK_SUSPENSE` | – | nee |
-| **1 — Vorderingen** |||||
-| 1300 | Debiteuren leden (rekening-courant) | asset | `AR_MEMBERS` | lid | ja |
-| 1310 | Debiteuren overig | asset | `AR_OTHER` | relatie | ja |
+| 1300 | Rekeningen leden | asset | `MEMBER_ACCOUNTS` | persoon | ja |
+| 1310 | Rekeningen externen (debiteuren overig) | asset | `EXTERNAL_ACCOUNTS` | persoon | ja |
+| 1350 | Nog te verdelen (activiteiten) | asset | `TO_DISTRIBUTE` | activiteit | ja |
 | 1320 | Nog te ontvangen bedragen | asset | `ACCRUED_INCOME` | – | ja |
 | 1400 | Vooruitbetaalde kosten | asset | `PREPAID_EXPENSES` | – | ja |
-| **1 — Schulden** |||||
-| 1600 | Crediteuren | liability | `AP` | relatie | ja |
-| 1610 | Te betalen declaraties / tegoeden leden | liability | `AP_MEMBERS` | lid | ja |
+| 1600 | Crediteuren | liability | `ACCOUNTS_PAYABLE` | persoon | ja |
 | 1700 | Nog te betalen kosten | liability | `ACCRUED_EXPENSES` | – | ja |
-| 1720 | Vooruitontvangen contributie | liability | `DEFERRED_CONTRIBUTION` | – | ja |
-| 1730 | Vooruitontvangen bedragen overig | liability | `DEFERRED_OTHER` | – | ja |
+| 1730 | Vooruitontvangen bedragen | liability | `DEFERRED_INCOME` | – | ja |
 
-"Resultaat lopend boekjaar" is **geen geboekte rekening** maar een berekende regel op de balans (som van alle resultaatrekeningen in het lopende jaar). Bij afsluiting wordt het via 0590 bestemd (§4, T23).
+Presentatie op de balans: rekeningen 1300/1310 worden per persoon bekeken; **positieve saldi** staan onder *vorderingen*, **negatieve saldi (tegoeden)** onder *schulden* ("tegoeden leden"). Zo is de balans correct zonder dat de gebruiker twee rekeningen hoeft te snappen. "Resultaat lopend boekjaar" is een berekende regel.
 
-Het **ledensaldo (rekening-courant)** van een lid = saldo 1300 − saldo 1610 voor die partij. Op de balans staan vorderingen en schulden aan leden bruto (niet gesaldeerd), zoals het hoort.
+### 4.2 Resultaat
 
-### 3.2 Resultaatrekeningen
-
-| Code | Naam | Type | Standaard-potje |
+| Code | Naam | Type | Standaardpotje |
 |---|---|---|---|
-| **8 — Baten** |||
 | 8000 | Contributie | income | Contributie |
 | 8100 | Sponsoring | income | Sponsoring |
 | 8110 | Donaties en giften | income | Algemeen |
-| 8200 | Borrelinkomsten | income | Borrels |
-| 8300 | Activiteitsbijdragen | income | (potje van activiteit) |
 | 8400 | Verhuur | income | Huisvesting |
 | 8800 | Rente | income | Algemeen |
 | 8900 | Overige baten | income | Algemeen |
-| 8950 | Onttrekking bestemmingsreserves | income | (potje van reserve) **[VRAAG 4]** |
-| **4 — Lasten** |||
-| 4000 | Kosten borrels | expense | Borrels |
+| 8950 | Onttrekking bestemmingsreserves | income | Reserveringen |
+| 4000 | Kosten borrels (dispuutsdeel) | expense | Borrels |
 | 4100 | Huisvesting | expense | Huisvesting |
-| 4200 | Kosten activiteiten | expense | Activiteiten |
+| 4200 | Kosten activiteiten (dispuutsdeel) | expense | Activiteiten |
 | 4300 | Kosten lustrum | expense | Lustrum |
 | 4400 | Bestuurskosten | expense | Bestuur |
 | 4500 | Bankkosten | expense | Bank |
@@ -502,368 +370,292 @@ Het **ledensaldo (rekening-courant)** van een lid = saldo 1300 − saldo 1610 vo
 | 4700 | Representatie en cadeaus | expense | Bestuur |
 | 4800 | Kas- en afrondingsverschillen | expense | Algemeen |
 | 4850 | Oninbare vorderingen | expense | Algemeen |
-| 4900 | Dotatie bestemmingsreserves | expense | (potje van reserve) **[VRAAG 4]** |
+| 4900 | Dotatie bestemmingsreserves | expense | Reserveringen |
 | 4990 | Overige kosten | expense | Algemeen |
 
-### 3.3 Potjes (seed, per boekjaar begrootbaar)
+Resultaatrekeningen met een vaste rol hebben ook een systeemsleutel: 8000 `CONTRIBUTION`, 8950 `RESERVE_WITHDRAWAL`, 4800 `CASH_DIFFERENCES`, 4850 `BAD_DEBTS`, 4900 `RESERVE_DOTATION`.
 
-Contributie · Sponsoring · Borrels · Huisvesting · Activiteiten · Lustrum · Bestuur · ALV · Bank · Algemeen.
+### 4.3 Potjes
 
-Elk potje heeft een standaard baten- en lastenrekening zodat de gebruiker in de UI alleen "potje" kiest; de rekening wordt afgeleid (overschrijfbaar in memoriaal). Begroting per potje per boekjaar, gesplitst in baten en lasten, optioneel verfijnd per rekening.
+Contributie · Sponsoring · Borrels · Huisvesting · Activiteiten · Lustrum · Bestuur · ALV · Bank · Reserveringen · Algemeen. Elk potje heeft een standaard baten- en lastenrekening; in de UI kies je alleen het potje. Begroting per potje per boekjaar (baten en lasten). **Reserveren via de begroting**: begrotingsregel op potje *Reserveringen* (lasten); de dotatie (T20) boekt die kosten en zet het bedrag in de bestemmingsreserve.
 
 ---
 
-## 4. Journaalpost-templates
+## 5. Journaalpost-templates
 
-Notatie: **D** = debet (positief bedrag), **C** = credit (negatief bedrag). Dimensies tussen haakjes: `pot`, `act` (activiteit), `party`, `oi` (openstaande post), `btx` (banktransactie). Elke template is een **pure functie** `(input) → EntryDraft` in `src/domain/ledger/templates/`, met eigen unit test.
+**D** = debet, **C** = credit. Dimensies: `pot`, `act`, `party`, `btx` (banktransactie), `inv` (factuur). Elke template is een pure functie `(input) → EntryDraft` in `src/domain/ledger/templates.ts` met eigen unit test.
 
-Omdat elke bankregel bij import al op 1099 staat, zeggen de toewijzingstemplates "D/C 1099" waar je bij een klassieke boekhouding "bank" zou verwachten.
-
-| # | Gebeurtenis | Regels | Opmerkingen |
+| # | Gebeurtenis | Regels | Opmerking |
 |---|---|---|---|
-| **T00** | **Banktransactie geïmporteerd** (inkomend bedrag *b*) | D 1000 *b* (btx) · C 1099 *b* (btx) | Uitgaand: tekens omgekeerd. Automatisch, altijd, bij import. Zorgt dat banksaldo = grootboek. |
-| **T01** | **Contributie-aanslag** (periode binnen boekjaar) | D 1300 *a* (party, oi) · C 8000 *a* (pot Contributie) | Maakt open item met kenmerk. |
-| **T02** | **Contributie-aanslag over boekjaargrens** | D 1300 *a* (party, oi) · C 8000 *a₁* (pot) · C 1720 *a₂* | *a₁/a₂* pro rata op dagen (largest remainder), *a₁+a₂=a*. Gaat de hele periode over volgend jaar: *a₁=0*. |
-| **T02b** | **Vrijval vooruitontvangen contributie** | D 1720 *a₂* · C 8000 *a₂* (pot Contributie) | Automatisch gegenereerd als eerste post van het nieuwe boekjaar (datum = startdatum). |
-| **T03** | **Ontvangst op openstaande post** (bank) | D 1099 *b* (btx) · C 1300/1310 *b* (party, oi) | Deelbetaling: open item blijft `partial`. Overbetaling: surplus als C 1610 (party) = tegoed lid **[VRAAG 7]**. |
-| **T03b** | **Incasso gestorneerd** (bank, uitgaand, `Reden retour` gevuld) | D 1300 *b* (party, oi) · C 1099 *b* (btx) | Heropent het open item; SEPA-item → `returned`; bij storno van FRST blijft volgende incasso FRST. Eventuele stornokosten: D 4500 (pot Bank) · C 1099. |
-| **T04** | **Declaratie ingediend** | *geen boeking* | Nog geen verplichting; alleen document + audit log. |
-| **T05** | **Declaratie goedgekeurd** | D 4xxx *d* (pot, act) · C 1610 *d* (party, oi) | Rekening = standaard lastenrekening van het potje. Staat als schuld op de balans. |
-| **T06** | **Declaratie uitbetaald** (bank) | D 1610 *d* (party, oi) · C 1099 *d* (btx) | Via toewijzen-scherm of PAIN.001-batch (later). |
-| **T06b** | **Declaratie verrekend met rekening-courant** | D 1610 *d* (party, oi) · C 1300 *d* (party, oi van vordering) | Bv. lid heeft nog contributie open. Alleen via ledenafrekening (T28). |
-| **T07** | **Declaratie afgewezen** | *geen boeking* | Vanuit `submitted`. Een al goedgekeurde declaratie intrekken = tegenboeking van T05 met reden. |
-| **T08** | **Inkoopfactuur ontvangen** | D 4xxx *f* (pot, act) · C 1600 *f* (party, oi) | Kosten voor volgend boekjaar: D 1400 i.p.v. 4xxx, met automatische vrijval (T25). |
-| **T09** | **Inkoopfactuur betaald** (bank) | D 1600 *f* (party, oi) · C 1099 *f* (btx) | |
-| **T10** | **Verkoopfactuur verstuurd** | D 1310 *v* (party, oi) · C 8xxx *vᵢ* per regel (pot) | Factuurnummer gapless, PDF gegenereerd en bevroren. |
-| **T11** | **Verkoopfactuur ontvangen** (bank) | D 1099 *v* (btx) · C 1310 *v* (party, oi) | |
-| **T12** | **Creditnota** | spiegel van T10, verwijst naar oorspronkelijke factuur | Factuur → `credited`. |
-| **T13** | **Activiteitsbijdrage opgelegd** (inschrijving/betaalverzoek) | D 1300 *c* (party, act, oi) · C 8300 *c* (pot van act, act) | Uniek kenmerk per deelnemer. |
-| **T13b** | **Activiteitsbijdrage direct ontvangen zonder aanslag** | D 1099 *c* (btx) · C 8300 *c* (pot, act, party) | Voor Tikkie-achtige betalingen; wordt in UI alsnog aan deelnemer gekoppeld. |
-| **T14** | **Directe kosten via bank** (bv. pinbetaling boodschappen) | D 4xxx *k* (pot, act?) · C 1099 *k* (btx) | Split over meerdere potjes/activiteiten mogelijk (meerdere D-regels). |
-| **T15** | **Activiteitsafrekening sluiten** | Per deelnemer met correctie: teruggave D 8300 (pot, act) · C 1610 (party, oi); bijbetaling D 1300 (party, oi) · C 8300 (pot, act) | Geen correcties ⇒ geen regels, alleen de lock. Resultaat staat al op het juiste potje (via `pot`-dimensie). Na sluiten: I10. |
-| **T16** | **Interne overboeking**, uitgaande kant (betaal → spaar) | D 1090 *t* · C 1099 *t* (btx betaal) | Automatisch herkend (tegenrekening = eigen IBAN). |
-| **T16b** | **Interne overboeking**, inkomende kant | D 1099 *t* (btx spaar) · C 1090 *t* | 1090 is 0 zodra beide kanten geïmporteerd zijn; afsluitchecklist controleert dat. |
-| **T17** | **Kasmutatie** (handmatig) | D 1050 *k* · C 1099 *k* (btx kas), daarna toewijzing zoals bij bank | Kas werkt als "bankrekening zonder import": dezelfde toewijslogica. |
-| **T17b** | **Contant naar bank gestort** | kas: D 1090 · C 1099; bank: D 1099 · C 1090 | Zelfde mechaniek als T16. |
-| **T18** | **Kastelling met verschil** | Tekort: D 4800 *x* (pot Algemeen) · C 1050 *x*. Overschot: omgekeerd. | Systeemtemplate (mag op 1050). Telling legt munten/biljetten vast. |
-| **T19** | **Rente spaarrekening** | D 1099 (btx) · C 8800 (pot Algemeen) | Matching-regel standaard aanwezig. |
-| **T20** | **Dotatie bestemmingsreserve** (in de exploitatie) | D 4900 *r* (pot van reserve) · C 05x0 *r* | Zichtbaar in begroting/resultaat. **[VRAAG 4]** |
-| **T21** | **Onttrekking bestemmingsreserve** | D 05x0 *r* · C 8950 *r* (pot van reserve) | Bv. lustrumkosten dekken uit lustrumfonds. **[VRAAG 4]** |
-| **T22** | **Overlopende post boekjaareinde** | Nog te betalen: D 4xxx (pot) · C 1700. Vooruitbetaald: D 1400 · C 4xxx. Nog te ontvangen: D 1320 · C 8xxx. Vooruitontvangen: D 8xxx · C 1730. | Memoriaal met vlag `auto_reverse`: tegenboeking automatisch als eerste post van het volgende jaar. |
-| **T23** | **Jaarafsluiting** | (a) Afsluitpost: per resultaatrekening × potje het saldo tegenboeken naar 0590. (b) Resultaatbestemming: D 0590 *R* · C 0500 *R₀* · C 05x0 *R₁…* (bij verlies omgekeerd) | Datum = laatste dag boekjaar, status `closing`. Na (a)+(b) is 0590 = 0 en alle resultaatrekeningen = 0 voor dat jaar. |
-| **T24** | **Beginbalans** (alleen eerste boekjaar ooit) | D bank/kas/vorderingen · C schulden/reserves | Enige manier om op bank/kas te boeken buiten import. Moet sluiten met eerste `balance_after − bedrag` van de eerste bankregel. |
-| **T25** | **Automatische tegenboeking overlopende post** | spiegel van T22, in nieuw jaar | |
-| **T26** | **Afboeken oninbare vordering** | D 4850 (pot Algemeen) · C 1300/1310 (party, oi) | Open item → `written_off`. Reden verplicht. |
-| **T27** | **Correctie (tegenboeking)** | exacte spiegel van de oorspronkelijke post, `reverses_entry_id` gevuld | Reden verplicht. Een post kan maar één keer worden tegengeboekt. Daarna eventueel nieuwe, juiste post. |
-| **T28** | **Ledenafrekening (verrekening)** | D 1610 (party, oiᵢ) · C 1300 (party, oiⱼ) voor de te verrekenen posten; restsaldo naar één nieuw open item (1300 of 1610) | Resultaat: één bedrag dat het lid moet betalen of terugkrijgt, met één kenmerk. |
-| **T29** | **Borrelafrekening (turflijst)** | D 1300 (party, oi) per lid · C 8200 (pot Borrels) | Alleen als het dispuut per lid turft. **[VRAAG 5]** |
-| **T30** | **Memoriaal** (vrij) | willekeurig, som = 0, niet op systeemrekeningen | Alleen penningmeester, reden verplicht. |
-| **T31** | **Toewijzing ongedaan maken** | = T27 op de toewijzingspost | Banktransactie gaat terug naar "toe te wijzen". De importpost T00 wordt nooit tegengeboekt (tenzij de bank zelf een storno doet, dan is dat een nieuwe regel). |
+| T00 | Banktransactie geïmporteerd (bedrag *b*, bij) | D 1000 *b* (btx) · C 1099 *b* (btx) | Af: tekens om. Altijd, automatisch. |
+| T01 | Contributie maand | D 1300 *c* (party) · C 8000 *c* (pot Contributie) | Op de 1e van de maand per actief lid, tarief van diens soort lid. Uniek per lid+maand. Geen boekjaargrens-probleem: een maand valt altijd in één boekjaar. |
+| T02 | Betaling van persoon (bank) | D 1099 *b* (btx) · C 1300/1310 *b* (party) | Te veel betaald ⇒ saldo wordt negatief = tegoed. |
+| T03 | Terugbetaling aan persoon (bank) | D 1300/1310 *b* (party) · C 1099 *b* (btx) | Bv. tegoed of goedgekeurde declaratie uitbetalen. |
+| T04 | Declaratie ingediend | *geen boeking* | |
+| T05 | Declaratie goedgekeurd | D 1350 *d* (act) **of** D 4xxx *d* (pot) · C 1300 *d* (party indiener) | Komt als tegoed op de rekening van de indiener; verrekend met wat hij/zij verschuldigd is. |
+| T06 | Declaratie afgewezen / ingetrokken | *geen boeking* | Na goedkeuring terugdraaien = T27. |
+| T07 | Uitgave voor activiteit (bank) — "bierfusten voor het feest" | D 1350 *k* (act) · C 1099 *k* (btx) | Staat tot afrekenen als "nog te verdelen". |
+| T08 | Uitgave dispuut (bank) | D 4xxx *k* (pot) · C 1099 *k* (btx) | |
+| T09 | Ontvangst dispuut (bank), bv. sponsoring, rente | D 1099 *b* (btx) · C 8xxx *b* (pot) | |
+| T10 | Ontvangst voor activiteit (bank), bv. kaartverkoop | D 1099 *b* (btx) · C 1350 *b* (act) | Verlaagt het te verdelen bedrag. |
+| T11 | **Activiteit afrekenen (verdelen)** | C 1350 *S* (act) · D 1300/1310 *sᵢ* (party, act) per deelnemer · D 4xxx *s₀* (pot van activiteit) voor dispuutsdeel | *S* = volledig saldo te verdelen; Σ*sᵢ* + *s₀* = *S* exact (largest remainder). Methoden: gelijk, naar gewicht (bv. streepjes bij de borrel), vast bedrag, mix. Negatief *S* (overschot) wordt op dezelfde manier teruggegeven. Daarna is de activiteit gesloten. |
+| T12 | Op rekening zetten (los bedrag) | D 1300/1310 *x* (party) · C 1350 (act) of C 8xxx (pot) | Bv. boete, kaartje, iets wat iemand kocht van het dispuut. |
+| T13 | Inkoopfactuur ontvangen | D 4xxx (pot) of D 1350 (act) · C 1600 (party, inv) | |
+| T14 | Inkoopfactuur betaald (bank) | D 1600 (party, inv) · C 1099 (btx) | |
+| T15 | Verkoopfactuur verstuurd | D 1310 (party, inv) · C 8xxx per regel (pot) | Nummer gapless, PDF bevroren. |
+| T16 | Verkoopfactuur ontvangen (bank) | D 1099 (btx) · C 1310 (party, inv) | |
+| T17 | Creditnota | spiegel van T15 | |
+| T18 | Interne overboeking, uitgaande kant | D 1090 · C 1099 (btx) | Automatisch: tegenrekening is eigen IBAN. |
+| T18b | Interne overboeking, inkomende kant | D 1099 (btx) · C 1090 | 1090 is 0 als beide kanten binnen zijn. |
+| T19 | Kasmutatie (handmatig ingevoerd) | D/C 1050 · C/D 1099 (btx kas) → daarna toewijzen als bank | Kas = "bankrekening zonder import". Kas ↔ bank loopt via 1090. |
+| T20 | Kastelling met verschil | Tekort: D 4800 (pot Algemeen) · C 1050; overschot omgekeerd | |
+| T21 | Dotatie bestemmingsreserve | D 4900 (pot Reserveringen) · C 05x0 | Volgens begroting. |
+| T22 | Onttrekking bestemmingsreserve | D 05x0 · C 8950 (pot Reserveringen) | Bv. lustrum betalen uit lustrumfonds. |
+| T23 | Overlopende post boekjaareinde | memoriaal met `auto_reverse` | Tegenboeking (T24) automatisch op dag 1 van het nieuwe jaar. |
+| T24 | Automatische tegenboeking overlopende post | spiegel T23 | |
+| T25 / T25b | Jaarafsluiting | T25: elk resultaatsaldo per rekening×potje naar 0590; T25b (resultaatbestemming): D 0590 · C 0500 (of verdeeld over reserves; bij verlies omgekeerd) | Status `closing`, datum = laatste dag. |
+| T26 | Beginbalans (installatiewizard) | D bank/kas (= saldo bij de bank), D/C 1300/1310 per persoon, D 1350 per open activiteit, C 1600, C reserves; verschil → 0500 | Enige manier om bank/kas buiten import te muteren; controle: banksaldo = saldo vóór eerste te importeren regel. |
+| T27 | Correctie (tegenboeking) | exacte spiegel, `reverses_entry_id` | Reden verplicht, max. één keer per post. |
+| T28 | Afboeken oninbaar | D 4850 (pot Algemeen) · C 1300/1310 (party) | Reden verplicht. |
+| T29 | Memoriaal | vrij, som 0, niet op systeemrekeningen | Alleen fiscus, reden verplicht. |
+| T30 | Toewijzing ongedaan maken | T27 op de toewijzingspost | Banktransactie weer "toe te wijzen". |
+| T31 | Split-toewijzing | combinatie van T02/T07/T08/T09/T10 in één post | Eén bankregel, meerdere bestemmingen; UI telt af tot €0,00. |
 
-**Bijbehorende tests** per template: bedragen sluiten, juiste rekeningen/dimensies, randgevallen (0 cent, grootste veilige bedrag, pro rata met rest, negatief resultaat bij T23).
+Ledenafrekening (bij uitschrijven), commissie-afrekening en bestuursafrekening zijn **rapporten + bevroren PDF**; ze boeken alleen iets als er echt geld verschuift (bv. afboeken T28).
 
 ---
 
-## 5. Bankkoppeling
+## 6. Bank
 
-### 5.1 `BankConnector`-interface
+### 6.1 `BankConnector`
 
 ```ts
 interface BankConnector {
-  readonly id: 'rabobank_csv' | 'camt053' | 'psd2_enablebanking' | 'psd2_gocardless';
+  readonly id: 'rabobank_csv' | 'camt053' | 'psd2';
   fetchTransactions(account: BankAccountRef, since: LocalDate): Promise<FetchResult>;
 }
-
 interface FetchResult {
-  transactions: NormalizedBankTransaction[];       // gesorteerd op boekdatum + volgorde
-  statementBalances?: { date: LocalDate; closingCents: Cents }[]; // CAMT OPBD/CLBD, PSD2 balances
-  warnings: ImportWarning[];
-}
-
-interface NormalizedBankTransaction {
-  accountIban: string;
-  externalId: string;               // idempotentiesleutel binnen de rekening
-  bookingDate: LocalDate;
-  valueDate: LocalDate | null;
-  amountCents: Cents;               // + bij, − af
-  balanceAfterCents: Cents | null;
-  counterpartyIban: string | null;
-  counterpartyName: string | null;
-  description: string;
-  endToEndId: string | null;
-  mandateRef: string | null;
-  creditorId: string | null;
-  paymentReference: string | null;
-  batchId: string | null;
-  returnReason: string | null;
-  raw: Record<string, unknown>;
+  transactions: NormalizedBankTransaction[];
+  statementBalances: { date: LocalDate; openingCents?: Cents; closingCents: Cents }[];
+  warnings: string[];
 }
 ```
 
-Bestandsconnectoren (`RabobankCsvConnector`, `Camt053Connector`) krijgen het geüploade bestand in hun constructor; `fetchTransactions` parst en filtert op `since`. Een PSD2-connector haalt live op. De importservice (`importTransactions(connector, account)`) is connector-agnostisch: dedupe → continuïteitscheck → T00 boeken → matching → audit log.
+Bestandsconnectoren krijgen het bestand in de constructor. De importservice is connector-agnostisch: dedupe → continuïteitscheck → T00 → voorstellen → audit log. Een PSD2-aggregator (Enable Banking / GoCardless) is later een extra implementatie.
 
-### 5.2 Rabobank CSV
+### 6.2 Rabobank CSV
 
-- Kolommen (zoals Rabo ze exporteert): `IBAN/BBAN, Munt, BIC, Volgnr, Datum, Rentedatum, Bedrag, Saldo na trn, Tegenrekening IBAN/BBAN, Naam tegenpartij, Naam uiteindelijke partij, Naam initiërende partij, BIC tegenpartij, Code, Batch ID, Transactiereferentie, Machtigingskenmerk, Incassant ID, Betalingskenmerk, Omschrijving-1, Omschrijving-2, Omschrijving-3, Reden retour, Oorspr bedrag, Oorspr munt, Koers`.
-- Parser zoekt kolommen op **naam** (niet positie), zodat een extra/verschoven kolom niet breekt; ontbrekende verplichte kolom = duidelijke foutmelding.
-- Encoding-detectie (UTF-8 met/zonder BOM, fallback Windows-1252); bedragen `+1.234,56` / `-12,50` → centen via stringparsing.
-- Eén bestand kan meerdere rekeningen bevatten (betaal + spaar) → gesplitst op `IBAN/BBAN`; onbekende IBAN = waarschuwing, niet stil negeren.
-- `externalId = Volgnr`. Continuïteit: `Volgnr` oplopend zonder gaten en `saldo_voor = Saldo na trn − Bedrag` moet gelijk zijn aan het grootboeksaldo vóór die regel.
+Kolommen op **naam** (niet positie): `IBAN/BBAN, Munt, BIC, Volgnr, Datum, Rentedatum, Bedrag, Saldo na trn, Tegenrekening IBAN/BBAN, Naam tegenpartij, …, Transactiereferentie, …, Betalingskenmerk, Omschrijving-1..3, Reden retour, …`. UTF-8 (met/zonder BOM) of Windows-1252; bedragen `+1.234,56` → centen via string. Meerdere rekeningen per bestand; `externalId = Volgnr`.
 
-### 5.3 CAMT.053
+### 6.3 CAMT.053
 
-- Ondersteunt `camt.053.001.02` (Rabobank) en tolerant `.001.08`. Per `Stmt`: rekening-IBAN, `Bal` OPBD/CLBD; per `Ntry`: `Amt`+`CdtDbtInd`, `BookgDt`, `ValDt`, `AcctSvcrRef`; per `TxDtls`: `EndToEndId`, `MndtId`, `RltdPties` (naam/IBAN), `RmtInf/Ustrd` en `Strd/CdtrRefInf/Ref`, `RtrInf/Rsn/Cd`.
-- `externalId`: de Rabobank-referentie die overeenkomt met het CSV-`Volgnr`, zodat CSV en CAMT van dezelfde periode elkaar dedupliceren. *Welk veld dit exact is, verifieer ik op echte voorbeeldbestanden* **[VRAAG 9]**. Als het niet 1-op-1 te koppelen is: per rekening wordt één formaat vastgezet en een tweede formaat voor dezelfde periode geweigerd.
-- Continuïteit: OPBD van het statement = grootboeksaldo; CLBD = grootboeksaldo na import.
-- Batchboekingen (één `Ntry` met meerdere `TxDtls`) worden bewaard als één banktransactie met detailregels, die bij toewijzen per detail kunnen worden gesplitst.
+`camt.053.001.02` (Rabobank), tolerant voor latere versies. Per statement: IBAN, OPBD/CLBD; per entry: bedrag + richting, boekdatum, `AcctSvcrRef`, tegenpartij, omschrijving. Continuïteit via OPBD/CLBD. Omdat er geen echte voorbeeldbestanden zijn, worden de fixtures synthetisch opgebouwd volgens de publieke specificatie en als zodanig gemarkeerd. Per bankrekening wordt vastgelegd welk formaat gebruikt wordt; CSV en CAMT door elkaar voor dezelfde rekening wordt geweigerd (want de volgnummers zijn niet gegarandeerd gelijk).
 
-### 5.4 Importregels
+### 6.4 Importregels
 
-1. Hash van het bestand; hetzelfde bestand opnieuw = "0 nieuw, N al aanwezig", geen fout.
-2. Per transactie `INSERT … ON CONFLICT (bank_account_id, external_id) DO NOTHING`. Een bestaande sleutel met *afwijkende* inhoud (bedrag/datum) = harde fout ("bankbestand wijkt af van eerdere import"), niet stil overslaan.
-3. **Continuïteitscheck**: het saldo vóór de eerste nieuwe regel moet gelijk zijn aan het huidige grootboeksaldo van de rekening. Zo niet: import geweigerd met "ontbrekende transacties tussen <datum> en <datum>". Transacties vóór de laatst geïmporteerde die nog niet bestonden (bijv. export overlapt) mogen, zolang de saldoketen sluit.
-4. Voor elke nieuwe transactie: T00, dan matching.
-5. Na import: grootboeksaldo = laatste `Saldo na trn` / CLBD (I7), anders rollback.
+1. Zelfde bestand opnieuw = "0 nieuw, N al aanwezig".
+2. Per transactie `ON CONFLICT DO NOTHING`; zelfde sleutel met andere inhoud = fout.
+3. Saldo vóór de eerste nieuwe regel moet = grootboeksaldo, anders weigeren met "ontbrekende transacties tussen … en …".
+4. T00 per nieuwe transactie; daarna voorstellen (§7).
+5. Na import: grootboeksaldo = laatste `Saldo na trn`/CLBD, anders rollback.
 
-### 5.5 Interne overboekingen
+### 6.5 Tikkie
 
-Tegenrekening-IBAN = IBAN van een eigen `bank_account` ⇒ matcher `internal` met confidence 0.99 ⇒ T16/T16b. Ook kas ↔ bank (T17b) via dezelfde tussenrekening 1090. Het rapport "Onderweg" toont ongepaarde kanten.
-
-### 5.6 SEPA Direct Debit (PAIN.008.001.02)
-
-- `GrpHdr`: `MsgId` (uniek), `CreDtTm`, `NbOfTxs`, `CtrlSum`, `InitgPty`.
-- Eén `PmtInf` per combinatie (`SeqTp` FRST/RCUR × incassodatum); `PmtMtd=DD`, `BtchBookg=false` (**zodat elke incasso als eigen bankregel terugkomt en per lid kan worden afgeletterd**), `SvcLvl=SEPA`, `LclInstrm=CORE`, `CdtrSchmeId` met incassant-ID (`Prtry=SEPA`).
-- Per `DrctDbtTxInf`: `EndToEndId` (= kenmerk van het open item), `InstdAmt`, `MndtId`, `DtOfSgntr`, bij IBAN-wijziging `AmdmntInd=true` + `OrgnlDbtrAcct`, debiteur-naam/IBAN, `RmtInf/Ustrd` met kenmerk en omschrijving.
-- Validatie: (1) domeinvalidatie (IBAN-checksum, mandaat actief, niet verlopen door 36 maanden inactiviteit, bedrag > 0, tekenset SEPA-subset, max. lengtes); (2) **XSD-validatie** tegen de meegeleverde `pain.008.001.02.xsd` (via `libxmljs2` of `xmllint-wasm`) in een test én bij genereren.
-- Incassodatum: minimaal 1 werkdag (TARGET2-kalender) na aanmaak voor CORE; UI stelt eerste geldige datum voor.
-- Na verwerking door de bank komt elke incasso terug als bankregel met `EndToEndId` → matcher `sepa` (0.99) → T03; storno → T03b.
-- **Later**: PAIN.001.001.03 voor declaratie- en crediteurenbetalingen, zelfde opzet.
+Tikkie-betalingen komen binnen van tegenpartij "Tikkie"/ABN AMRO met in de omschrijving de naam en IBAN van de betaler. De voorstel-logica haalt die IBAN/naam uit de omschrijving, zodat een Tikkie-betaling net zo makkelijk aan een persoon wordt gekoppeld als een gewone overboeking. De app maakt geen Tikkies zelf aan (Tikkie-API is niet gratis); ze toont per externe het bedrag en een kopieerbare tekst.
 
 ---
 
-## 6. Matching engine
+## 7. Toewijzen ("waar geboekt")
 
-### 6.1 Kenmerken
+Het toewijzen-scherm is de kern: links de lijst **Nog toe te wijzen (X)** met *bij/af*, *bedrag*, *tegenpartij*, *omschrijving*; rechts de keuze **Waar geboekt?**
 
-Elke openstaande post krijgt bij aanmaak een kenmerk: `<type><jj><volgnr 5 cijfers><controlecijfer>`, weergegeven als `C25-00042-7`.
-Types: `C` contributie, `A` activiteit, `F` verkoopfactuur, `B` betaalverzoek overig, `L` ledenafrekening. Controlecijfer (mod 11) vangt tikfouten af. Herkenningsregex is tolerant voor spaties/streepjes/hoofdletters. Het kenmerk komt in SEPA `EndToEndId`, factuur-PDF, betaalverzoekmail en de omschrijving die we leden vragen te gebruiken. **[VRAAG 10]**
+- **Persoon** (lid of extern) → T02/T03
+- **Activiteit** (nog te verdelen) → T07/T10
+- **Potje** (kosten/opbrengsten van het dispuut) → T08/T09
+- **Factuur** (openstaande inkoop-/verkoopfactuur) → T14/T16
+- **Interne overboeking** → T18/T18b
+- **Splitsen** → T31
 
-### 6.2 Matchers (in volgorde, hoogste confidence wint)
+**Voorstellen** zijn deterministisch en worden alleen voorgevuld; bevestigen is één klik:
 
-| Matcher | Criterium | Confidence | Voorstel |
-|---|---|---|---|
-| `sepa` | `EndToEndId` = bekend SEPA-item | 0.99 | T03 (of T03b bij `Reden retour`) |
-| `internal` | tegenrekening = eigen IBAN | 0.99 | T16/T16b |
-| `reference` | geldig kenmerk in omschrijving/`Betalingskenmerk`, bedrag = openstaand bedrag | 0.97 | T03/T11/T09 |
-| `reference_partial` | kenmerk gevonden, bedrag wijkt af | 0.70 | T03 met deelbetaling of overbetaling |
-| `rule` | gebruikersregel: tegenrekening, regex op omschrijving/naam, bedragsrange, richting, rekening | regel-confidence (standaard 0.90) | split volgens regel |
-| `open_item_amount` | tegenrekening = IBAN van partij én precies één open item met exact dit bedrag | 0.85 (meerdere: 0.50 elk) | T03/T09/T06 |
-| `same_as_last` | zelfde tegenrekening + omschrijving gelijkend (genormaliseerde tokens, Jaccard ≥ 0.6) als eerdere handmatige toewijzing | 0.60 bij 1 eerdere, 0.75 bij 2, 0.85 bij ≥ 3 consistente | kopie van laatste toewijzing (verhoudingsgewijs bij split) |
+| Voorstel | Wanneer | Automatisch geboekt? |
+|---|---|---|
+| Interne overboeking | tegenrekening is een eigen IBAN | **ja** (100% zeker), gemarkeerd "automatisch" |
+| Persoon | tegenrekening-IBAN (of IBAN in Tikkie-omschrijving) hoort bij precies één persoon | nee |
+| Regel | een door de fiscus gemaakte regel (exacte IBAN en/of exacte tekst) | alleen als de fiscus die regel zelf op "automatisch" zette |
+| Zelfde als vorige keer | exact dezelfde tegenrekening-IBAN én dezelfde bestemming de vorige keer | nee |
 
-### 6.3 Beslisregels
-
-- Hoogste voorstel ≥ **drempel** (instelbaar, standaard **0.95**) **én** geen tweede voorstel binnen 0.05 **én** geen deelbetaling ⇒ automatisch boeken, gemarkeerd `is_automatic` ("automatisch"), terug te draaien met één klik (T31).
-- Anders ⇒ voorstel(len) in het toewijzen-scherm, gesorteerd op confidence.
-- "Regel maken van deze toewijzing" vanuit het toewijzen-scherm maakt een `match_rule` (`origin=manual`); `same_as_last` leert impliciet.
-- Matchers zijn pure functies `(tx, context) → Suggestion[]` → volledig unit-testbaar zonder DB.
-
-### 6.4 Toewijzen-scherm (UX-schets)
-
-Links de lijst "Nog toe te wijzen (X)", rechts de gekozen transactie met voorstellen als kaarten ("Contributie 2025 — Jan Jansen — €75,00 — 97% zeker"). Handmatig: kies *Openstaande post*, *Potje (+ activiteit)*, *Persoon*, *Interne overboeking*, of *Splitsen* (meerdere regels, teller "nog €12,50 te verdelen" tot 0). Geen debet/credit in beeld.
+Bij een onbekende IBAN die aan een persoon wordt toegewezen vraagt de app "IBAN onthouden voor Jan?" zodat het volgende keer voorgesteld wordt. Elke automatische of bevestigde toewijzing kan worden teruggedraaid (T30).
 
 ---
 
-## 7. Statusdiagrammen
+## 8. Leden, contributie, maandmail, declaraties, activiteiten
 
-### 7.1 Declaratie
+**Soorten leden** maakt de fiscus zelf aan (naam + contributie per maand, bv. "Lid € 15", "Aspirant € 10", "Oud-lid € 5", "Reünist € 0"). Elk lid heeft één soort.
+
+**Contributie**: dagelijkse job (Vercel Cron, gratis) boekt op de 1e van de maand T01 voor elk lid dat die dag actief is. Idempotent (I12). Ook handmatig te starten ("contributie september boeken") en in te halen voor gemiste maanden.
+
+**Maandmail (debiteurenlijst)**: op `statement_day` maakt de app per persoon (leden, en externen met een saldo) een overzicht: beginsaldo, alle mutaties van de maand (contributie, aandelen in activiteiten, declaraties, betalingen), eindsaldo, en *"Maak € X over naar NL.. t.n.v. … o.v.v. je naam"* of *"Je hebt een tegoed van € X"*. **Veiligheid**: wordt alleen automatisch verstuurd als de boekhouding bij is (0 transacties toe te wijzen); anders blijft hij als concept staan en krijgt de fiscus een melding. De fiscus kan altijd eerst een voorbeeld bekijken. Verzending via gratis SMTP (bv. Gmail met app-wachtwoord of Brevo free tier); lokaal Mailpit.
+
+**Declaraties**: lid dient in (bedrag, activiteit óf potje, omschrijving, foto/PDF van de bon). Fiscus keurt goed (T05) of wijst af met reden. Goedgekeurd = bijgeschreven op de rekening van de indiener. Geen vier-ogen-controle (goedkeuringen gebeuren vaak fysiek in vergaderingen).
+
+**Activiteiten**: naam, datum, potje (voor het dispuutsdeel). Alles wat ervoor wordt uitgegeven of ontvangen (bank, declaraties, inkoopfacturen) komt op "nog te verdelen". **Afrekenen**: kies deelnemers (leden en externen), methode per deelnemer (gelijk / gewicht / vast bedrag) en optioneel een dispuutsdeel; de app laat zien wat iedereen betaalt, tot op de cent kloppend. Bevestigen boekt T11, maakt de afrekening-PDF en sluit de activiteit. Borrels werken hetzelfde: per borrel (of per maand) een activiteit, verdelen naar streepjes of gelijk.
+
+**Externen** (andere disputen, sponsoren, leveranciers): eigen rekening zoals leden. Voor een ander dispuut dat mee-deed: één regel op hun rekening; zij regelen onderling de verdeling.
+
+---
+
+## 9. Installatiewizard (nieuw dispuut)
+
+Bij de eerste start (`setup_completed = false`) en alleen voor de eerste gebruiker:
+1. Naam dispuut, e-mailadres fiscus (wordt de eerste fiscus), startmaand boekjaar (standaard augustus).
+2. Bankrekeningen (IBAN + naam; betaal, spaar, kas).
+3. Soorten leden met maandcontributie.
+4. Leden (handmatig of plakken uit een spreadsheet: naam, e-mail, soort, jaargang, IBAN).
+5. **Beginsituatie** (T26): saldo per bankrekening en kas op de startdatum, openstaand saldo per persoon, reserves; eventuele open activiteiten met te verdelen bedrag. Het verschil gaat naar de algemene reserve; de wizard toont de beginbalans ter controle.
+6. Rekeningschema en potjes worden met de standaard gevuld (later aan te passen).
+
+---
+
+## 10. Rollen
+
+Rollen per boekjaar, zodat bestuursoverdracht één handeling is ("nieuw bestuur" voor het nieuwe boekjaar). De vorige fiscus houdt de rol op het oude jaar om dat af te sluiten.
+
+| | Fiscus (beheerder) | Bestuur | Lid | Kascommissie |
+|---|---|---|---|---|
+| Alles inzien | ✔ | ✔ | eigen rekening + eigen declaraties | ✔ incl. audit log en bijlagen |
+| Bank importeren, toewijzen, activiteiten, facturen, leden | ✔ | ✔ | – | – |
+| Declaratie indienen | ✔ | ✔ | ✔ | – |
+| Declaratie goedkeuren/afwijzen | ✔ | – | – | – |
+| Activiteit definitief afrekenen | ✔ | – (voorbereiden mag) | – | – |
+| Memoriaal, tegenboeking, beginbalans | ✔ | – | – | – |
+| Boekjaar afsluiten/heropenen | ✔ | – | – | – |
+| Instellingen, rollen, soorten leden | ✔ | – | – | – |
+| Iets wijzigen | ✔ | ✔ (zie boven) | eigen declaraties | **nooit** |
+
+Iedereen met een lidmaatschap kan inloggen (e-mail magic link, Auth.js). Alleen e-mailadressen die bekend zijn in de ledenlijst (of als gebruiker zijn toegevoegd) kunnen inloggen. Autorisatie in elke server action via `requireRole()`; geen UI-only checks.
+
+---
+
+## 11. Statusdiagrammen
+
+### 11.1 Declaratie
 
 ```mermaid
 stateDiagram-v2
-    [*] --> ingediend: lid dient in (bon verplicht)
+    [*] --> ingediend: lid dient in met bon
     ingediend --> ingetrokken: indiener trekt in
-    ingediend --> goedgekeurd: bestuurslid keurt goed (T05), niet de indiener zelf
-    ingediend --> afgewezen: bestuurslid wijst af (reden verplicht, T07)
-    goedgekeurd --> uitbetaald: bankregel toegewezen (T06), of verrekend (T06b)
-    goedgekeurd --> ingediend: penningmeester trekt goedkeuring in (tegenboeking T27, reden verplicht)
-    uitbetaald --> goedgekeurd: toewijzing ongedaan (T31)
+    ingediend --> goedgekeurd: fiscus keurt goed (T05, op rekening indiener)
+    ingediend --> afgewezen: fiscus wijst af (reden verplicht)
+    goedgekeurd --> ingediend: fiscus draait terug (T27, reden verplicht)
+    goedgekeurd --> [*]
     afgewezen --> [*]
     ingetrokken --> [*]
-    uitbetaald --> [*]
 ```
 
-### 7.2 Verkoopfactuur
+### 11.2 Verkoopfactuur
 
 ```mermaid
 stateDiagram-v2
     [*] --> concept
-    concept --> verzonden: versturen (nummer + PDF bevroren, T10)
-    concept --> [*]: verwijderen (nog niets geboekt)
-    verzonden --> deels_betaald: deelontvangst (T11)
-    verzonden --> betaald: volledige ontvangst (T11)
-    deels_betaald --> betaald: restant ontvangen
-    verzonden --> gecrediteerd: creditnota (T12)
-    deels_betaald --> gecrediteerd: creditnota voor restant
-    verzonden --> oninbaar: afboeken (T26)
-    deels_betaald --> oninbaar: afboeken restant (T26)
-    betaald --> deels_betaald: toewijzing ongedaan (T31)
-```
-
-### 7.3 Inkoopfactuur
-
-```mermaid
-stateDiagram-v2
-    [*] --> concept: PDF geüpload / ingevoerd
-    concept --> geboekt: penningmeester boekt (T08)
+    concept --> verzonden: versturen (nummer en PDF bevroren, T15)
     concept --> [*]: verwijderen
-    geboekt --> deels_betaald: deelbetaling (T09)
-    geboekt --> betaald: betaling (T09)
-    deels_betaald --> betaald
-    geboekt --> gecrediteerd: creditfactuur leverancier
-    betaald --> geboekt: toewijzing ongedaan (T31)
+    verzonden --> deels_betaald: deelontvangst (T16)
+    verzonden --> betaald: ontvangst (T16)
+    deels_betaald --> betaald: restant ontvangen
+    verzonden --> gecrediteerd: creditnota (T17)
+    verzonden --> oninbaar: afboeken (T28)
+    betaald --> verzonden: toewijzing ongedaan (T30)
 ```
 
-### 7.4 Activiteit
+### 11.3 Inkoopfactuur
 
 ```mermaid
 stateDiagram-v2
-    [*] --> concept: aangemaakt (potje + begroting)
-    concept --> open: inschrijving/betaalverzoeken (T13)
-    open --> in_afrekening: activiteit geweest
-    in_afrekening --> open: terug (nog geen afrekening definitief)
-    in_afrekening --> gesloten: afrekening definitief (PDF + T15)
-    gesloten --> in_afrekening: heropenen (penningmeester, reden verplicht)
-    note right of gesloten: geen boekingen meer met deze activiteit (I10)
+    [*] --> concept: ingevoerd met PDF
+    concept --> geboekt: boeken (T13)
+    concept --> [*]: verwijderen
+    geboekt --> betaald: betaling toegewezen (T14)
+    betaald --> geboekt: toewijzing ongedaan (T30)
+    geboekt --> gecrediteerd: creditfactuur
 ```
 
-### 7.5 Boekjaar
+### 11.4 Activiteit
 
 ```mermaid
 stateDiagram-v2
-    [*] --> gepland
-    gepland --> open: openen (T02b/T25 automatisch geboekt)
-    open --> in_afsluiting: start afsluiting (checklist moet groen zijn)
-    in_afsluiting --> open: terug naar open
-    in_afsluiting --> afgesloten: afsluitposten T23 geboekt, ALV-jaarrekening gegenereerd
-    afgesloten --> in_afsluiting: heropenen (reden verplicht, T23 wordt tegengeboekt)
-    note right of open: twee jaren mogen tegelijk open zijn (overdrachtsperiode), jaar N kan pas afgesloten worden als N-1 afgesloten is
+    [*] --> open: aangemaakt
+    open --> open: uitgaven en ontvangsten op nog te verdelen
+    open --> afgerekend: fiscus bevestigt verdeling (T11, PDF)
+    afgerekend --> open: heropenen (fiscus, reden, T27 op T11)
+    note right of afgerekend: geen boekingen meer op deze activiteit
 ```
 
-**Afsluitchecklist** (alle punten verplicht groen, tenzij expliciet "geaccepteerd met toelichting" door penningmeester — vastgelegd in audit log):
-1. Alle banktransacties met boekdatum in het jaar toegewezen (1099 = 0 per jaareinde).
-2. Laatste bankimport dekt het jaareinde (er is een bankregel of statement ná de einddatum, of het saldo is bevestigd).
-3. Kastelling op of rond jaareinde vastgelegd.
-4. 1090 Interne overboekingen onderweg = 0.
-5. Geen declaraties met status `ingediend` in het jaar.
-6. Overlopende posten beoordeeld (vinkje + eventueel T22-posten).
-7. Alle activiteiten van het jaar `gesloten`.
-8. Vorig boekjaar `afgesloten`.
-9. Resultaatbestemming ingevuld (bedrag naar algemene reserve / bestemmingsreserves).
+### 11.5 Boekjaar
 
-### 7.6 Overige levenscycli (kort)
+```mermaid
+stateDiagram-v2
+    [*] --> open: aangemaakt (T24 automatisch)
+    open --> in_afsluiting: checklist groen
+    in_afsluiting --> open: terug
+    in_afsluiting --> afgesloten: T25 geboekt, jaarrekening gegenereerd
+    afgesloten --> in_afsluiting: heropenen (reden, T25 tegengeboekt)
+    note right of open: oud en nieuw jaar mogen tegelijk open zijn tijdens de overdracht
+```
 
-- **Open item**: `open → partial → settled`; `open|partial → written_off | cancelled`. Status is een cache van het saldo van de gekoppelde journaalregels.
-- **SEPA-batch**: `draft → generated (XML + XSD ok) → uploaded (penningmeester markeert) → processed (alle items collected/returned)`.
-- **Mandaat**: `active → revoked | expired`; `first_collection_done` wordt pas `true` als de FRST-incasso daadwerkelijk is ontvangen.
-- **Afrekening (settlement)**: `draft → submitted → approved → final`; bij `final` wordt de PDF bevroren (sha256 in audit log) en de eventuele boeking gemaakt.
+**Afsluitchecklist**: (1) alle banktransacties van het jaar toegewezen; (2) bankimport loopt tot na het jaareinde; (3) kas geteld; (4) 1090 = 0; (5) geen declaraties `ingediend`; (6) alle activiteiten van het jaar afgerekend (of bewust doorgeschoven: het te verdelen bedrag blijft dan gewoon op de balans staan); (7) overlopende posten beoordeeld; (8) vorig boekjaar afgesloten; (9) resultaatbestemming ingevuld.
 
 ---
 
-## 8. Afrekeningen
+## 12. Rapportages
 
-| Type | Wie | Inhoud PDF | Boeking |
-|---|---|---|---|
-| Activiteitsafrekening | penningmeester of commissievoorzitter van het potje; definitief door penningmeester | begroting vs realisatie, kosten per bron (declaraties/facturen/bankregels), bijdragen per deelnemer, wie moet nog betalen/terugkrijgen | T15 (evt. leeg) + sluiten |
-| Ledenafrekening | penningmeester (bij uitschrijven of periodiek, ook in bulk) | rekening-courant op peildatum: alle posten, saldo, betaal- of terugbetaalinstructie met kenmerk | T28 (verrekening + één nieuw open item) |
-| Commissie-afrekening | commissievoorzitter dient in, penningmeester keurt goed | begroting vs realisatie van het potje over een periode, toelichting voorzitter, lijst transacties | geen financiële mutatie **[VRAAG 6]** |
-| Bestuursafrekening | penningmeester (aftredend) | balans, resultaat t.o.v. begroting, openstaande posten, mandaten, lopende activiteiten, checklist, vrije "wat de opvolger moet weten" | geen financiële mutatie **[VRAAG 6]** |
+Per boekjaar met vergelijking vorig jaar; PDF (@react-pdf/renderer) en Excel (exceljs).
 
-Elke afrekening bevriest een `snapshot` (JSON van alle cijfers) zodat de PDF later exact reproduceerbaar is, ook na nieuwe boekingen.
-
----
-
-## 9. Rollen en rechten
-
-Rollen per boekjaar (`role_assignment`). **Bestuursoverdracht** = scherm "Nieuw bestuur": nieuwe rollen voor het nieuwe boekjaar invullen, één knop. De aftredende penningmeester houdt zijn/haar rol op het oude jaar, zodat die het oude jaar kan afsluiten terwijl de opvolger al in het nieuwe jaar werkt. **[VRAAG 1]**
-
-| Actie | Penningmeester | Bestuurslid | Commissievoorzitter | Lid | Kascommissie |
-|---|---|---|---|---|---|
-| Bank importeren, toewijzen, memoriaal | ✔ | – | – | – | – |
-| Alles inzien | ✔ | ✔ | eigen potje + activiteiten | eigen saldo/declaraties | ✔ (alleen lezen) |
-| Declaratie indienen | ✔ | ✔ | ✔ | ✔ | – |
-| Declaratie goedkeuren/afwijzen | ✔ (niet eigen) | ✔ (niet eigen) | – **[VRAAG 3]** | – | – |
-| Activiteiten beheren | ✔ | – | eigen potje | – | – |
-| Commissie-afrekening indienen / goedkeuren | ✔ goedkeuren | – | ✔ indienen | – | – |
-| Contributie, incasso, facturen | ✔ | inzien | – | – | inzien |
-| Boekjaar afsluiten/heropenen | ✔ | – | – | – | – |
-| Audit log + bijlagen | ✔ | – | – | – | ✔ |
-| Rollen beheren | ✔ | – | – | – | – |
-
-Autorisatie wordt in elke server action gecontroleerd via `requireRole(user, fiscalYear, role, {potId?})`; geen UI-only checks.
-
-Auth: Auth.js v5 met e-mail magic link (Drizzle-adapter, SMTP/Resend **[VRAAG 14]**). Alleen e-mailadressen die bij een lid of `app_user` bekend zijn kunnen inloggen.
+1. **Debiteurenlijst** — per persoon saldo (moet betalen / tegoed), plus "nog te verdelen" per open activiteit. Dit is het dagelijkse werkoverzicht.
+2. **Balans** — met specificatie per post.
+3. **Resultatenrekening** — per potje: baten, lasten, begroting, verschil.
+4. **Kasstroomoverzicht** — per rekening: begin, in, uit, eind.
+5. **Ledensaldi / rekening-courant per persoon** (ook de ledenafrekening bij uitschrijven).
+6. **Begroting volgend jaar** — invoer naast realisatie en begroting dit jaar.
+7. **Kascommissie-pakket (zip)** — journaal, bankregels met toewijzing, grootboekkaarten, audit log met hash-verificatie, bijlagen, afrekening-PDF's.
+8. **ALV-jaarrekening** — één PDF: balans, resultaat vs begroting, toelichting per potje, reserves, begroting volgend jaar.
 
 ---
 
-## 10. Rapportages
+## 13. Besluitenlog (antwoorden opdrachtgever, v1 → v2)
 
-Alle rapporten per boekjaar, met kolom vorig jaar, exporteerbaar als PDF (@react-pdf/renderer) en Excel (exceljs). Rapportberekeningen zijn pure functies op een lijst journaalregels ⇒ testbaar.
-
-1. **Balans** — activa/passiva, specificatie per post (klik door naar partijen/transacties); regel "resultaat lopend boekjaar".
-2. **Resultatenrekening** — per potje: baten, lasten, saldo; begroting; verschil (€ en %); doorklik per rekening/activiteit.
-3. **Kasstroomoverzicht** — per bank-/kasrekening: beginsaldo, in, uit, eindsaldo (interne overboekingen apart getoond).
-4. **Openstaande posten** — debiteuren en crediteuren, ouderdomskolommen 0-30 / 31-60 / 61-90 / >90 dagen.
-5. **Ledensaldi** — per lid rekening-courant, filter op status/jaargang; bulk-herinnering.
-6. **Begroting volgend jaar** — invoer per potje, naast realisatie huidig jaar en begroting huidig jaar.
-7. **Kascommissie-pakket (zip)** — journaal (CSV + PDF), alle bankregels met toewijzing, grootboekkaart per rekening, audit log (incl. hash-keten verificatie), alle bijlagen met index, alle afrekening-PDF's.
-8. **ALV-jaarrekening (één PDF)** — voorblad, balans, resultatenrekening met begroting, toelichting per potje (vrije tekst + cijfers), bestemmingsreserves-verloop, begroting volgend jaar, verklaring kascommissie (optioneel veld).
-
----
-
-## 11. Teststrategie
-
-- **Unit**: elke journaalpost-template (T00–T31), money-helpers, kenmerk-generator/validator, contributie pro rata, elke matcher, CSV-parser, CAMT-parser, PAIN.008-generator (+ XSD-validatie), rapportberekeningen.
-- **Property-based (fast-check)**:
-  - P1: voor elke willekeurige geldige template-input sluit de post op nul.
-  - P2: na een willekeurige reeks gebeurtenissen (import, toewijzen, declaraties, facturen, tegenboekingen, jaarafsluiting) geldt: som alle regels = 0; activa = passiva + EV + resultaat; grootboeksaldo bank = laatste `balance_after`; saldo open items = som van hun regels; na afsluiting resultaatrekeningen = 0.
-  - P3: import is idempotent: bestand twee keer importeren ≡ één keer; willekeurige overlappende exports ≡ vereniging.
-  - P4: tegenboeking + origineel = nul effect op alle saldi.
-- **Integratie** (Vitest + echte Postgres via docker-compose/testcontainers): triggers I1–I10 (UPDATE/DELETE geweigerd, boeken in gesloten jaar geweigerd, …).
-- **Fixtures**: `/fixtures/rabobank/*.csv`, `/fixtures/camt053/*.xml` — zie **[VRAAG 9]**; tot die er zijn maak ik synthetische bestanden volgens het formaat, duidelijk gemarkeerd als synthetisch.
-
----
-
-## 12. Bouwvolgorde (bevestiging van de opdracht)
-
-| Stap | Oplevering | "Werkend" betekent |
+| # | Vraag | Besluit |
 |---|---|---|
-| a | Project-setup, docker-compose (Postgres + MinIO + Mailpit), Drizzle-schema + triggers, Auth.js magic link, rollen, seed (voorbeelddispuut, ~40 leden, rekeningschema, potjes, afgesloten jaar 2024-2025 + lopend 2025-2026) | inloggen, rol zien, rekeningschema en leden bekijken |
-| b | `postEntry()`, alle templates als pure functies, invariant- en property-tests | memoriaal boeken, journaal en grootboekkaart bekijken |
-| c | BankConnector, CSV + CAMT, idempotentie, continuïteit, interne overboekingen | bestand uploaden, banksaldo klopt, teller "toe te wijzen" |
-| d | Matching engine + toewijzen-scherm + regels | transacties toewijzen/splitsen/terugdraaien |
-| e | Leden, mandaten, contributie, open posten, PAIN.008, herinneringsmail | contributie opleggen, incassobestand downloaden, afletteren |
-| f | Declaraties (bonupload), inkoop- en verkoopfacturen (PDF) | volledige flows t/m betaling |
-| g | Activiteiten + vier afrekeningstypes met PDF | activiteit afrekenen en sluiten |
-| h | Kasboek + kastelling, memoriaal-UI, bestemmingsreserves | kas bijhouden, dotatie boeken |
-| i | Rapportages (PDF/Excel), jaarafsluiting met checklist, kascommissie-zip, ALV-jaarrekening | jaar afsluiten en ALV-stukken genereren |
-
-Na goedkeuring van dit plan maak ik eerst `CLAUDE.md` (kernprincipes, structuur, conventies) en begin dan aan stap a.
+| 1 | Boekjaar | Gelijk aan bestuurs-/collegejaar; start instelbaar, standaard **1 augustus**. |
+| 2 | Contributie | **Per maand**; soorten leden **zelf aan te maken** met eigen maandbedrag. |
+| 3 | Goedkeuren | **Fiscus** keurt alles goed en is beheerder. Geen vier-ogen-controle. |
+| 4 | Reserves | Reserveren via de begroting (potje Reserveringen, T21). Onttrekken via T22. |
+| 5 | Borrels | Achteraf verdelen over de aanwezigen (gelijk of naar streepjes) op ieders eigen rekening; externen/andere disputen krijgen één bedrag (Tikkie), regelen onderling. |
+| 6 | Commissie-/bestuursafrekening | PDF + audit log, geen boeking zonder mutatie. |
+| 7 | Te veel betaald | Wordt **tegoed** (negatief saldo op eigen rekening). |
+| 8 | Matching | **Geen** confidence/fuzzy matching. Alleen zekere voorstellen; automatisch alleen interne overboekingen en expliciet door fiscus aangezette regels. |
+| 9 | Voorbeeldbestanden | Niet beschikbaar → synthetische fixtures volgens publiek formaat. Toewijzen-scherm volgt de bestaande werkwijze: *bij/af · bedrag · waar geboekt*. |
+| 10 | Kenmerk | Geen kenmerk met controlecijfer. Leden betalen "o.v.v. naam"; herkenning via bekende IBAN. Facturen hebben hun factuurnummer. |
+| 11 | Potjes als dimensie | Akkoord. |
+| 12 | Incasso | **Geen incasso** (PAIN.008 geschrapt). Wel automatische **maandmail** per persoon met saldo en betaalinstructie. |
+| 13 | Start | **Installatiewizard** met instelbare beginsituatie; geschikt voor nieuwe disputen. |
+| 14 | E-mail/hosting | **Alleen gratis**: SMTP naar keuze (Gmail app-wachtwoord / Brevo free), Vercel Hobby, Neon Free; bijlagen in S3-compatibele opslag (MinIO lokaal, Supabase Storage free) met beeldcompressie. |
+| 15 | Inloggen | Iedereen. Lid: eigen rekening + declaraties. Bestuur: alles inzien en bewerken. Kascommissie: alles inzien, niets wijzigen. |
+| – | Werkwijze debiteurenlijst | Uitgaven vooruit (bierfusten) staan op **nog te verdelen** bij de activiteit; bij afrekenen naar de rekeningen van deelnemers (en externen). Tot betaald = debiteur. |
+| – | Commissievoorzitter-rol | Voorlopig geschrapt (niet genoemd); later toe te voegen als rol met één potje. |
 
 ---
 
-## 13. Open vragen (graag beantwoorden vóór of bij goedkeuring)
+## 14. Bouwvolgorde
 
-1. **Boekjaar**: loopt het boekjaar gelijk met het bestuursjaar/collegejaar (bv. 1 sep – 31 aug) of is het het kalenderjaar? Wanneer vindt de overdracht plaats t.o.v. de ALV waarop de jaarrekening wordt vastgesteld?
-2. **Contributie**: tarieven per categorie (aspirant / lid / oud-lid / reünist)? Per jaar of per semester? Pro rata bij instroom/uitschrijving halverwege? Betalen oud-leden/reünisten contributie of een vrijwillige donatie?
-3. **Goedkeuren declaraties**: mag elk bestuurslid goedkeuren, of alleen specifieke functies? Bedraggrens waarboven twee goedkeurders nodig zijn? Mag een commissievoorzitter declaraties binnen het eigen potje goedkeuren? (Voorstel: nooit je eigen declaratie; penningmeester-declaraties door een ander bestuurslid.)
-4. **Reserves**: welke bestemmingsreserves wil je (lustrumfonds, huisfonds, anders)? Dotaties **in de exploitatie** (kostenpost 4900, zichtbaar in begroting — gebruikelijk bij disputen) of alleen via **resultaatbestemming** bij jaarafsluiting? Of beide? En worden lustrumkosten via onttrekking (8950) gedekt?
-5. **Borrel afrekenen**: wordt er per lid geturfd (streeplijst/turfsysteem) en periodiek afgerekend? Is er een pinautomaat (SumUp/Zettle) waarvan uitbetalingen op de bank binnenkomen? Of alleen contant?
-6. **Commissie- en bestuursafrekening**: jij schreef "altijd een PDF + boeking". Bij deze twee verandert er financieel niets. Akkoord dat die alleen een bevroren PDF + audit-logregel opleveren, en alleen een boeking als er echt iets verschuift?
-7. **Overbetalingen**: laat een lid dat te veel betaalt een tegoed staan (1610, te verrekenen) of wil je standaard terugbetalen?
-8. **Drempel automatisch boeken**: is 0.95 goed als standaard? (In de praktijk: SEPA-incasso's, interne overboekingen en exacte kenmerk+bedrag-matches gaan automatisch; de rest wordt voorgesteld.)
-9. **Voorbeeldbestanden**: `/fixtures` bestaat nog niet. Kun je een **geanonimiseerde** Rabobank CSV-export en een CAMT.053-export van dezelfde periode (betaal + spaar) aanleveren? Daarmee verifieer ik encoding, bedragnotatie en welk CAMT-veld overeenkomt met `Volgnr`. Zo niet, dan maak ik synthetische fixtures.
-10. **Kenmerkformaat** `C25-00042-7`: akkoord, of liever een ander (korter/langer, met dispuutsprefix)?
-11. **Potjes als dimensie** (§0): akkoord? Het alternatief (één grootboekrekening per potje) is eenvoudiger te snappen maar maakt "activiteitsbijdragen voor het lustrum" en begroting-per-potje rommeliger.
-12. **Incasso**: heeft het dispuut al een Rabo incassocontract + incassant-ID (Creditor ID)? Zijn er bestaande machtigingen (papier/digitaal) met mandaat-ID's die we moeten overnemen?
-13. **Startsituatie**: begint de app met een nieuw boekjaar (beginbalans T24 uit de vorige jaarrekening), of wil je historische jaren importeren?
-14. **E-mail**: welke provider voor magic links en herinneringen (Resend, SMTP van de universiteit/Google Workspace, …)? Lokaal gebruik ik Mailpit.
-15. **Ledenlogin**: moeten alle leden kunnen inloggen (eigen saldo, declaraties), of in eerste instantie alleen bestuur, commissievoorzitters en kascommissie?
+| Stap | Oplevering |
+|---|---|
+| a | Project-setup, docker-compose (Postgres, MinIO, Mailpit), Drizzle-schema + SQL-triggers, Auth.js magic link, rollen, seed (voorbeelddispuut: ~40 leden, soorten leden, rekeningschema, potjes; boekjaar 2025-2026 afgesloten, 2026-2027 lopend) |
+| b | `postEntry()`/`reverseEntry()`, templates als pure functies, invariant- en property-tests, journaal/grootboek/debiteurenlijst-schermen |
+| c | BankConnector, Rabobank CSV + CAMT.053, idempotentie, continuïteit, interne overboekingen |
+| d | Toewijzen-scherm + deterministische voorstellen + regels |
+| e | Leden, soorten leden, maandcontributie (cron), maandmail |
+| f | Declaraties met bon-upload; inkoop- en verkoopfacturen |
+| g | Activiteiten + verdelen/afrekenen met PDF; leden-, commissie- en bestuursafrekening |
+| h | Kasboek + kastelling, memoriaal-UI, bestemmingsreserves |
+| i | Rapportages, jaarafsluiting met checklist, kascommissie-pakket, ALV-jaarrekening, installatiewizard afgerond |
