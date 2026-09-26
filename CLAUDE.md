@@ -63,6 +63,14 @@ fixtures/              bank export samples (synthetic, documented as such)
 tests/                 DB integration and property tests (unit tests sit next to domain code)
 ```
 
+## Prototype (browser-only)
+
+`prototype/` is a standalone React app that runs the same domain code (`src/domain/**`) against an
+in-browser ledger (`prototype/src/ledger.ts`) that enforces the DB trigger rules in `post()`.
+`npm run prototype` builds it into ONE self-contained file, `docs/index.html` (GitHub Pages / double-click).
+Commit the rebuilt `docs/index.html` whenever prototype or domain code changes. Data lives in
+localStorage; backup/restore is a JSON file.
+
 ## Commands
 
 Production runs on **Vercel (Hobby) + Neon (Free)**; no Docker. `npm run vercel-build` applies

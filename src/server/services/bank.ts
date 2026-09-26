@@ -16,21 +16,8 @@ import { centsFromDb, cents, type Cents, formatEuro } from "@/domain/money";
 import { localDate, type LocalDate } from "@/domain/dates";
 import { normalizeIban } from "./setup";
 
-export interface NormalizedBankTransaction {
-  accountIban: string | null; // null for cash
-  externalId: string;
-  bookingDate: LocalDate;
-  valueDate: LocalDate | null;
-  amount: Cents;
-  balanceAfter: Cents | null;
-  counterpartyIban: string | null;
-  counterpartyName: string | null;
-  description: string;
-  endToEndId?: string | null;
-  paymentReference?: string | null;
-  returnReason?: string | null;
-  raw?: Record<string, unknown>;
-}
+import type { NormalizedBankTransaction } from "@/domain/bank/types";
+export type { NormalizedBankTransaction };
 
 export class ImportError extends Error {
   constructor(message: string) {

@@ -1,0 +1,2 @@
+"IBAN/BBAN","Munt","BIC","Volgnr","Datum","Rentedatum","Bedrag","Saldo na trn","Tegenrekening IBAN/BBAN","Naam tegenpartij","Naam uiteindelijke partij","Naam initiërende partij","BIC tegenpartij","Code","Batch ID","Transactiereferentie","Machtigingskenmerk","Incassant ID","Betalingskenmerk","Omschrijving-1","Omschrijving-2","Omschrijving-3","Reden retour","Oorspr bedrag","Oorspr munt","Koers"
+"NL91RABO0315273637","EUR","RABONL2U","000000000000000001","2026-10-01","2026-10-01","+7,50","+7,50","","Zoë Brouwer","","","","","","","","","","Borrel","","","","","",""

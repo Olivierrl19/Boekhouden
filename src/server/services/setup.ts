@@ -15,22 +15,8 @@ export interface InstallInput {
   bankAccounts: { name: string; iban: string | null; kind: "checking" | "savings" | "cash" }[];
 }
 
-export function normalizeIban(iban: string): string {
-  return iban.replace(/\s+/g, "").toUpperCase();
-}
-
-/** ISO 13616 mod-97 check. */
-export function isValidIban(iban: string): boolean {
-  const s = normalizeIban(iban);
-  if (!/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/.test(s)) return false;
-  const rearranged = s.slice(4) + s.slice(0, 4);
-  let remainder = 0;
-  for (const ch of rearranged) {
-    const code = ch >= "A" && ch <= "Z" ? (ch.charCodeAt(0) - 55).toString() : ch;
-    for (const digit of code) remainder = (remainder * 10 + Number(digit)) % 97;
-  }
-  return remainder === 1;
-}
+export { isValidIban, normalizeIban } from "@/domain/bank/iban";
+import { isValidIban, normalizeIban } from "@/domain/bank/iban";
 
 /**
  * Install organisation settings, the default chart of accounts, pots and bank accounts.

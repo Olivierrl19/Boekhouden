@@ -4,7 +4,38 @@ Boekhouding voor een studentendispuut: iedereen een eigen rekening, activiteiten
 maandelijkse debiteurenlijst, en de bank als bron van waarheid. Zie **PLAN.md** voor het
 volledige ontwerp en **CLAUDE.md** voor de werkafspraken in de code.
 
-## Online zetten (gratis, alles in de browser)
+## Prototype: direct proberen, zonder iets te installeren
+
+Het prototype is **één HTML-bestand** (`docs/index.html`) dat alles in de browser doet: geen server,
+geen database, geen account, niets te installeren, gratis. De gegevens blijven in de browser op je
+eigen computer (met back-up/terugzetten als bestand).
+
+**Openen, manier 1: als website via GitHub Pages (gratis, eenmalig instellen)**
+1. Ga op GitHub naar de repository → **Settings** → **Pages**.
+2. Bij *Build and deployment* kies je **Source: Deploy from a branch**.
+3. Kies de branch `claude/student-association-accounting-5f775g` en de map **`/docs`**, en klik **Save**.
+4. Na een minuut staat het prototype op **https://olivierrl19.github.io/Boekhouden/**. Die link kun je delen.
+
+**Openen, manier 2: bestand downloaden**
+Open op GitHub `docs/index.html`, klik op **Download raw file** (het pijltje) en dubbelklik het bestand.
+
+Kies dan **Start voorbeelddispuut** om rond te kijken, of maak je eigen dispuut aan. Wissel linksonder
+van rol (fiscus, bestuur, kascommissie of een lid) om te zien wat iedereen ziet en mag.
+
+Wat werkt in het prototype: Rabobank-CSV importeren (dubbel importeren boekt niets dubbel, gaten in
+het saldo worden geweigerd), toewijzen ("waar geboekt") met voorstellen op bekend IBAN en Tikkie,
+splitsen, ongedaan maken, debiteurenlijst, maandmail per persoon (via je eigen mailprogramma),
+leden en soorten leden, maandcontributie, activiteiten met "nog te verdelen" en afrekenen (gelijk,
+streepjes, vast bedrag, dispuutsdeel), declaraties met foto van de bon, kasboek, rapportages
+(balans, resultaat per potje vs begroting, vorig jaar), journaal, bestemmingsreserves, memoriaal,
+boekjaar afsluiten met controlelijst, zelfcontrole en logboek met hash-keten, export naar Excel/CSV
+en afdrukken als PDF.
+
+Prototype opnieuw bouwen na codewijzigingen: `npm run prototype`.
+
+## Volledige versie online zetten (later)
+
+De volledige versie (met inloggen per e-mail en een echte database) staat in `src/app` en draait op Vercel + Neon.
 
 Je hebt niets op je eigen computer nodig. Je gebruikt twee gratis diensten:
 **Vercel** (hier draait de website) en **Neon** (hier staat de database). Reken op zo'n 15 minuten.
@@ -86,5 +117,7 @@ of de gewone Opdrachtprompt (cmd).
 
 ## Status
 
-Klaar: bouwstappen a (schema, inloggen, rollen, voorbeelddata), b (boekingsmotor met controles) en de
-installatiewizard. Volgende: bankbestanden importeren (c) en het toewijzen-scherm (d). Zie PLAN.md §14.
+- **Prototype** (`docs/index.html`): alle kernfuncties werkend in de browser, om te laten zien en te testen.
+- **Volledige versie** (`src/app`): bouwstappen a (schema, inloggen, rollen) en b (boekingsmotor met
+  databasecontroles) en de installatiewizard. De Rabobank-CSV-lezer en de voorstellen zijn gedeeld met
+  het prototype. Zie PLAN.md §14 voor de rest.

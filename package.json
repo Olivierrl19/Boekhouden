@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:unit": "vitest run --project unit",
-    "vercel-build": "npm run db:migrate && next build"
+    "vercel-build": "npm run db:migrate && next build",
+    "prototype": "node prototype/build.mjs"
   },
   "dependencies": {
     "@auth/drizzle-adapter": "^1.11.3",
@@ -26,12 +27,13 @@
     "next-auth": "^5.0.0-beta.32",
     "nodemailer": "^8.0.11",
     "postgres": "^3.4.9",
-    "react": "19.2.8",
-    "react-dom": "19.2.8",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "tailwind-merge": "^3.7.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@tailwindcss/cli": "^4.3.3",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^22.20.4",
     "@types/nodemailer": "^8.0.2",
@@ -39,6 +41,7 @@
     "@types/react-dom": "^19",
     "dotenv": "^18.0.4",
     "drizzle-kit": "^0.31.11",
+    "esbuild": "^0.28.2",
     "eslint": "^9",
     "eslint-config-next": "16.3.6",
     "fast-check": "^4.10.2",
