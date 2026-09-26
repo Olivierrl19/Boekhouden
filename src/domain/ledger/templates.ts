@@ -243,6 +243,39 @@ export function savingsSettled(input: {
   });
 }
 
+// T34 — return a pot's surplus (e.g. beer money not spent) to members' accounts, pro rata
+export function potSurplusReturned(input: {
+  potId: string;
+  expenseAccountId: string;
+  date: LocalDate;
+  amount: Cents; // total to return (> 0)
+  /** Integer weights per member, e.g. months of beer contribution paid. */
+  shares: { partyId: string; weight: number }[];
+  description: string;
+}): EntryDraft {
+  if (input.amount <= 0) throw new LedgerError("Terug te geven bedrag moet positief zijn");
+  const shares = input.shares.filter((s) => s.weight > 0);
+  if (!shares.length) throw new LedgerError("Kies minimaal één lid om het bedrag over te verdelen");
+  for (const s of shares) {
+    if (!Number.isSafeInteger(s.weight)) throw new LedgerError("Gewicht moet een geheel getal zijn");
+  }
+  if (new Set(shares.map((s) => s.partyId)).size !== shares.length) throw new LedgerError("Ieder lid mag maar één keer voorkomen");
+  const parts = allocate(input.amount, shares.map((s) => s.weight));
+  return build({
+    date: input.date,
+    template: "T34",
+    description: input.description,
+    sourceType: "pot",
+    sourceId: input.potId,
+    lines: [
+      { account: { id: input.expenseAccountId }, amount: input.amount, potId: input.potId, description: input.description },
+      ...shares
+        .map((s, i) => ({ account: { key: "MEMBER_ACCOUNTS" } as AccountRef, amount: negate(parts[i]), partyId: s.partyId }))
+        .filter((l) => l.amount !== 0),
+    ],
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Cost/income target used by claims, charges and purchase invoices
 // ---------------------------------------------------------------------------
@@ -698,17 +731,24 @@ export function openingBalance(input: {
   bank: { ledgerAccountId: string; amount: Cents }[];
   persons: { partyId: string; partyKind: PartyKind; amount: Cents }[];
   activities: { activityId: string; amount: Cents }[];
-  other: { accountId: string; amount: Cents }[];
+  other: { accountId: string; amount: Cents; description?: string }[];
+  /** Open (> 0) or prepaid (< 0) contribution per member. */
+  contributions?: { partyId: string; amount: Cents }[];
+  /** Savings per member and goal, as a credit (< 0: the association holds the member's money). */
+  savings?: { partyId: string; goalId: string; amount: Cents }[];
+  reason?: string;
 }): EntryDraft | null {
   const lines: LineDraft[] = [
     ...input.bank.map((b) => ({ account: { id: b.ledgerAccountId }, amount: b.amount })),
     ...input.persons.map((p) => ({ account: personAccount(p.partyKind), amount: p.amount, partyId: p.partyId })),
+    ...(input.contributions ?? []).map((c) => ({ account: { key: "CONTRIBUTION_RECEIVABLE" } as AccountRef, amount: c.amount, partyId: c.partyId })),
+    ...(input.savings ?? []).map((v) => ({ account: { key: "MEMBER_SAVINGS" } as AccountRef, amount: v.amount, partyId: v.partyId, savingsGoalId: v.goalId })),
     ...input.activities.map((a) => ({
       account: { key: "TO_DISTRIBUTE" } as AccountRef,
       amount: a.amount,
       activityId: a.activityId,
     })),
-    ...input.other.map((o) => ({ account: { id: o.accountId }, amount: o.amount })),
+    ...input.other.map((o) => ({ account: { id: o.accountId }, amount: o.amount, description: o.description ?? null })),
   ].filter((l) => l.amount !== 0);
   if (lines.length === 0) return null;
   const balancing = negate(sum(lines.map((l) => l.amount)));
@@ -717,7 +757,7 @@ export function openingBalance(input: {
     date: input.date,
     template: "T26",
     description: "Beginbalans",
-    reason: "Beginsituatie ingesteld bij installatie",
+    reason: input.reason ?? "Beginsituatie ingesteld bij installatie",
     lines,
   });
 }

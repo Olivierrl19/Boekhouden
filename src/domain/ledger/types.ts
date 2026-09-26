@@ -62,6 +62,7 @@ export const TEMPLATE_CODES = {
   T31: "Gesplitste toewijzing",
   T32: "Spaargeld verrekend",
   T33: "Spaarplan inleg/uitbetaling",
+  T34: "Overschot potje terug naar leden",
 } as const;
 export type TemplateCode = keyof typeof TEMPLATE_CODES;
 

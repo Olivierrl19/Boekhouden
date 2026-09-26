@@ -163,3 +163,8 @@ export function download(fileName: string, content: string, type = "text/csv;cha
 export function csvLine(values: (string | number | null | undefined)[]): string {
   return values.map((v) => `"${String(v ?? "").replace(/"/g, '""')}"`).join(";");
 }
+
+/** True when a click landed on a form control or link, so a clickable row should not toggle. */
+export function isControl(target: EventTarget | null): boolean {
+  return target instanceof Element && !!target.closest("input, select, textarea, button, a, label");
+}

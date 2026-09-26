@@ -9,10 +9,11 @@ import { Money } from "@/components/money";
 import { cents, formatEuro, sum, type Cents } from "@/domain/money";
 import { addMonths, firstOfMonth, formatDateNl, formatMonthNl, localDate, type LocalDate } from "@/domain/dates";
 import { formatIban } from "@/domain/bank/iban";
-import { currentFiscalYear, resultByPot, today, type Party, type State } from "../ledger";
+import { currentFiscalYear, resultByPot, today, type MemberType, type Party, type State } from "../ledger";
 export type { Ledger as StatementLedger };
 import { A, Empty, Field, PageHeader, ReadOnlyNotice, Select, csvLine, download, go, parseAmount, useAction, useApp, useCan, useLedger } from "./core";
 import { lineTarget } from "./labels";
+import { parseHundredths } from "@/domain/joint-activity";
 
 // ---------------------------------------------------------------------------
 // Dashboard
@@ -195,6 +196,8 @@ export function DebtorsPage() {
         <Button variant="outline" onClick={exportCsv}><Download /> Excel/CSV</Button>
         <Button variant="outline" onClick={() => window.print()}><Printer /> Afdrukken</Button>
       </PageHeader>
+
+      <BulkCharge />
 
       <Card className="print:hidden">
         <CardHeader>
@@ -467,17 +470,19 @@ function MemberEdit({ party, onDone }: { party: Party; onDone: () => void }) {
   const { store, actor } = useApp();
   const { state } = useLedger();
   const run = useAction();
-  const [f, setF] = useState({ email: party.email ?? "", memberTypeId: party.member!.memberTypeId, cohort: String(party.member!.cohort ?? ""), ibans: party.ibans.join(", "), leftOn: party.member!.leftOn ?? "" });
+  const [f, setF] = useState({ firstName: party.member!.firstName, lastName: party.member!.lastName, email: party.email ?? "", memberTypeId: party.member!.memberTypeId, cohort: String(party.member!.cohort ?? ""), ibans: party.ibans.join(", "), leftOn: party.member!.leftOn ?? "" });
   const set = (k: keyof typeof f) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => setF({ ...f, [k]: e.target.value });
   return (
     <div className="grid gap-3 py-2 sm:grid-cols-5">
+      <Field label="Voornaam"><Input value={f.firstName} onChange={set("firstName")} /></Field>
+      <Field label="Achternaam"><Input value={f.lastName} onChange={set("lastName")} /></Field>
       <Field label="E-mail"><Input value={f.email} onChange={set("email")} /></Field>
-      <Field label="Soort lid"><Select value={f.memberTypeId} onChange={set("memberTypeId")}>{state.memberTypes.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</Select></Field>
+      <Field label="Soort lid" hint="Per maand afwijken: Contributie → Ledenplanning"><Select value={f.memberTypeId} onChange={set("memberTypeId")}>{state.memberTypes.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</Select></Field>
       <Field label="Jaargang"><Input value={f.cohort} onChange={set("cohort")} /></Field>
       <Field label="IBAN(s), komma-gescheiden"><Input value={f.ibans} onChange={set("ibans")} /></Field>
       <Field label="Uitgeschreven per" hint="Leeg = actief lid"><Input type="date" value={f.leftOn} onChange={set("leftOn")} /></Field>
       <div className="flex gap-2 sm:col-span-5">
-        <Button size="sm" onClick={() => run(() => { store.updateMember(party.id, { email: f.email || null, memberTypeId: f.memberTypeId, cohort: f.cohort ? Number(f.cohort) : null, ibans: f.ibans.split(",").map((x) => x.trim()).filter(Boolean), leftOn: f.leftOn ? localDate(f.leftOn) : null }, actor); onDone(); }, "Opgeslagen")}>Opslaan</Button>
+        <Button size="sm" onClick={() => run(() => { store.updateMember(party.id, { firstName: f.firstName, lastName: f.lastName, email: f.email || null, memberTypeId: f.memberTypeId, cohort: f.cohort ? Number(f.cohort) : null, ibans: f.ibans.split(",").map((x) => x.trim()).filter(Boolean), leftOn: f.leftOn ? localDate(f.leftOn) : null }, actor); onDone(); }, "Opgeslagen")}>Opslaan</Button>
         <Button size="sm" variant="ghost" onClick={onDone}>Annuleren</Button>
       </div>
     </div>
@@ -485,30 +490,92 @@ function MemberEdit({ party, onDone }: { party: Party; onDone: () => void }) {
 }
 
 function MemberTypeRow({ id }: { id: string }) {
-  const { store, actor } = useApp();
   const { state } = useLedger();
   const isAdmin = useCan("admin");
-  const run = useAction();
   const t = state.memberTypes.find((x) => x.id === id)!;
   const count = state.parties.filter((p) => p.active && p.member?.memberTypeId === id).length;
   const [edit, setEdit] = useState(false);
-  const [name, setName] = useState(t.name);
-  const [amount, setAmount] = useState((t.monthly / 100).toFixed(2).replace(".", ","));
+  const potName = (pid: string | null | undefined) => state.pots.find((p) => p.id === pid)?.name;
   if (edit) {
     return (
       <TableRow>
-        <TableCell><Input value={name} onChange={(e) => setName(e.target.value)} /></TableCell>
-        <TableCell><Input value={amount} onChange={(e) => setAmount(e.target.value)} className="w-24" /></TableCell>
-        <TableCell className="text-right"><Button size="sm" onClick={() => run(() => { store.updateMemberType(id, { name, monthly: parseAmount(amount) }, actor); setEdit(false); }, "Opgeslagen (geldt vanaf de volgende contributiemaand)")}>Opslaan</Button></TableCell>
+        <TableCell colSpan={3}><MemberTypeEditor type={t} onDone={() => setEdit(false)} /></TableCell>
       </TableRow>
     );
   }
   return (
     <TableRow>
-      <TableCell>{t.name} <span className="text-xs text-muted-foreground">({count} leden)</span></TableCell>
+      <TableCell>
+        {t.name} <span className="text-xs text-muted-foreground">({count} leden)</span>
+        {(t.split?.length || t.restPotId) ? (
+          <div className="text-xs text-muted-foreground">
+            {(t.split ?? []).map((p) => `${potName(p.potId)} ${formatEuro(p.amount)}`).join(" · ")}
+            {t.restPotId && `${t.split?.length ? " · " : ""}rest naar ${potName(t.restPotId)}`}
+          </div>
+        ) : null}
+      </TableCell>
       <TableCell><Money value={t.monthly} /> / mnd</TableCell>
       <TableCell className="text-right">{isAdmin && <Button size="sm" variant="ghost" onClick={() => setEdit(true)}>Wijzigen</Button>}</TableCell>
     </TableRow>
+  );
+}
+
+/** Edit a member type: contribution, fixed parts per pot (e.g. woonkamer, bier) and the rest pot. */
+function MemberTypeEditor({ type, onDone }: { type: MemberType; onDone: () => void }) {
+  const { store, actor } = useApp();
+  const { state } = useLedger();
+  const run = useAction();
+  const euro = (c: number) => (c / 100).toFixed(2).replace(".", ",");
+  const [name, setName] = useState(type.name);
+  const [amount, setAmount] = useState(euro(type.monthly));
+  const [parts, setParts] = useState<{ potId: string; amount: string }[]>((type.split ?? []).map((p) => ({ potId: p.potId, amount: euro(p.amount) })));
+  const [restPotId, setRestPotId] = useState(type.restPotId ?? "");
+  const [paysGeneral, setPaysGeneral] = useState(type.paysGeneral ?? false);
+  const [paysYoung, setPaysYoung] = useState(type.paysYoung ?? false);
+  const [rateLike, setRateLike] = useState(type.rateLikeTypeId ?? "");
+  return (
+    <div className="flex flex-col gap-3 py-2">
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="Naam"><Input value={name} onChange={(e) => setName(e.target.value)} /></Field>
+        <Field label="Contributie per maand"><Input value={amount} onChange={(e) => setAmount(e.target.value)} /></Field>
+      </div>
+      <div className="text-sm font-medium">Vaste delen per potje <span className="font-normal text-muted-foreground">(bijv. woonkamer € 5,50 en bier € 15,00)</span></div>
+      {parts.map((p, i) => (
+        <div key={i} className="flex gap-2">
+          <Select value={p.potId} onChange={(e) => setParts(parts.map((x, j) => (j === i ? { ...x, potId: e.target.value } : x)))}>
+            {state.pots.map((pot) => <option key={pot.id} value={pot.id}>{pot.name}</option>)}
+          </Select>
+          <Input value={p.amount} onChange={(e) => setParts(parts.map((x, j) => (j === i ? { ...x, amount: e.target.value } : x)))} className="w-28" />
+          <Button variant="ghost" size="sm" onClick={() => setParts(parts.filter((_, j) => j !== i))}>Weg</Button>
+        </div>
+      ))}
+      <div><Button variant="outline" size="sm" onClick={() => setParts([...parts, { potId: state.pots[0].id, amount: "" }])}>Vast deel toevoegen</Button></div>
+      <Field label="De rest gaat naar" hint="Leeg = volgens de algemene contributieverdeling (Contributie → Verdeling)">
+        <Select value={restPotId} onChange={(e) => setRestPotId(e.target.value)}>
+          <option value="">Algemene verdeling</option>
+          {state.pots.map((pot) => <option key={pot.id} value={pot.id}>{pot.name}</option>)}
+        </Select>
+      </Field>
+      <div className="text-sm font-medium">Voor het berekenen van de contributie uit de begroting</div>
+      <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={paysGeneral} onChange={(e) => setPaysGeneral(e.target.checked)} /> Betaalt mee aan de posten voor alle leden</label>
+      <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={paysYoung} onChange={(e) => setPaysYoung(e.target.checked)} /> Betaalt mee aan de jongerejaarsposten</label>
+      <Field label="Of: zelfde tarief als" hint="Bijv. nieuwe lichting betaalt het jongerejaarstarief; het deel boven de vaste delen gaat naar het rest-potje (truien)">
+        <Select value={rateLike} onChange={(e) => setRateLike(e.target.value)}>
+          <option value="">—</option>
+          {state.memberTypes.filter((x) => x.id !== type.id).map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+        </Select>
+      </Field>
+      <div className="flex gap-2">
+        <Button size="sm" onClick={() => run(() => {
+          store.updateMemberType(type.id, {
+            name, monthly: parseAmount(amount), split: parts.filter((p) => p.amount.trim()).map((p) => ({ potId: p.potId, amount: parseAmount(p.amount) })),
+            restPotId: restPotId || null, paysGeneral, paysYoung, rateLikeTypeId: rateLike || null,
+          }, actor);
+          onDone();
+        }, "Opgeslagen (geldt vanaf de volgende contributiemaand)")}>Opslaan</Button>
+        <Button size="sm" variant="ghost" onClick={onDone}>Annuleren</Button>
+      </div>
+    </div>
   );
 }
 
@@ -530,4 +597,70 @@ function NewMemberType() {
 export function useLineTarget() {
   const { state, d } = useLedger();
   return (l: Parameters<typeof lineTarget>[2]) => lineTarget(state, d, l);
+}
+
+/** A column of the old "Ledenrekening" sheet: an amount per member for one item, booked in one go. */
+function BulkCharge() {
+  const { store, actor } = useApp();
+  const { state } = useLedger();
+  const canEdit = useCan("edit");
+  const run = useAction();
+  const [open, setOpen] = useState(false);
+  const targets = [
+    ...state.activities.filter((a) => a.status === "open").map((a) => ({ value: `activity:${a.id}`, label: `${a.number} ${a.name}` })),
+    ...state.pots.map((p) => ({ value: `pot:${p.id}`, label: `Potje ${p.name}` })),
+  ];
+  const [f, setF] = useState({ target: "", description: "", price: "", date: today() as string });
+  const [values, setValues] = useState<Record<string, string>>({});
+  if (!canEdit) return null;
+  const members = state.parties.filter((p) => p.kind === "member" && p.active).sort((a, b) => a.name.localeCompare(b.name));
+  const amountFor = (raw: string): Cents => {
+    if (!raw.trim()) return cents(0);
+    if (!f.price.trim()) return parseAmount(raw);
+    return cents(Math.round((parseAmount(f.price) * parseHundredths(raw)) / 100));
+  };
+  let total = 0;
+  let error = "";
+  try {
+    total = sum(members.map((m) => amountFor(values[m.id] ?? "")));
+  } catch (e) {
+    error = (e as Error).message;
+  }
+  return (
+    <Card className="print:hidden">
+      <CardHeader className="flex-row flex-wrap items-end justify-between gap-3">
+        <div>
+          <CardTitle>Bedragen op ledenrekeningen zetten</CardTitle>
+          <CardDescription>Zoals een kolom in de oude ledenrekening: turflijst, een gedeelde maaltijd, drankjes, extra bij/af. Met een prijs per stuk vul je het aantal in (bijv. streepjes); zonder prijs het bedrag (negatief = tegoed).</CardDescription>
+        </div>
+        <Button variant="outline" onClick={() => setOpen((v) => !v)}>{open ? "Verbergen" : "Openen"}</Button>
+      </CardHeader>
+      {open && (
+        <CardContent className="flex flex-col gap-3">
+          <div className="grid gap-3 sm:grid-cols-4">
+            <Field label="Omschrijving"><Input value={f.description} onChange={(e) => setF({ ...f, description: e.target.value })} placeholder="Turf juni" /></Field>
+            <Field label="Opbrengst naar"><Select value={f.target} onChange={(e) => setF({ ...f, target: e.target.value })}><option value="">Kies…</option>{targets.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}</Select></Field>
+            <Field label="Prijs per stuk (optioneel)"><Input value={f.price} onChange={(e) => setF({ ...f, price: e.target.value })} placeholder="0,70" /></Field>
+            <Field label="Datum"><Input type="date" value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} /></Field>
+          </div>
+          <div className="grid gap-x-6 gap-y-1 sm:grid-cols-2 lg:grid-cols-3">
+            {members.map((m) => (
+              <label key={m.id} className="flex items-center justify-between gap-2 text-sm">
+                <span>{m.name}</span>
+                <Input value={values[m.id] ?? ""} onChange={(e) => setValues({ ...values, [m.id]: e.target.value })} className="h-8 w-24 text-right" placeholder={f.price ? "aantal" : "0,00"} inputMode="decimal" />
+              </label>
+            ))}
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-sm">{error ? <span className="text-red-600">{error}</span> : <>Totaal {formatEuro(cents(total))}</>}</span>
+            <Button disabled={!!error || !total || !f.target} onClick={() => run(() => {
+              const [kind, id] = f.target.split(":") as ["activity" | "pot", string];
+              store.chargeMany({ date: localDate(f.date), target: { kind, id }, description: f.description, items: members.map((m) => ({ partyId: m.id, amount: amountFor(values[m.id] ?? "") })) }, actor);
+              setValues({});
+            }, "Op de rekeningen gezet")}>Boeken</Button>
+          </div>
+        </CardContent>
+      )}
+    </Card>
+  );
 }

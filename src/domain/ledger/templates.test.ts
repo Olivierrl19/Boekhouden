@@ -14,6 +14,7 @@ import {
   memorial,
   mirrorEntry,
   openingBalance,
+  potSurplusReturned,
   purchaseInvoiceReceived,
   reserveDotation,
   reserveWithdrawal,
@@ -244,6 +245,30 @@ describe("T05 expense claim approved", () => {
       ["id:4400", 1000],
       ["MEMBER_ACCOUNTS", -1000],
     ]);
+  });
+});
+
+describe("T34 pot surplus returned to members", () => {
+  it("returns beer money pro rata to months paid, exact to the cent", () => {
+    const d = potSurplusReturned({
+      potId: "bier",
+      expenseAccountId: "4000",
+      date: D,
+      amount: cents(92180),
+      shares: [{ partyId: "a", weight: 12 }, { partyId: "b", weight: 9 }, { partyId: "c", weight: 1 }, { partyId: "d", weight: 0 }],
+      description: "Geld terug bier",
+    });
+    expect(d.template).toBe("T34");
+    expect(sum(d.lines.map((l) => l.amount))).toBe(0);
+    const members = d.lines.filter((l) => l.partyId);
+    expect(members.map((l) => l.partyId)).toEqual(["a", "b", "c"]);
+    expect(sum(members.map((l) => l.amount))).toBe(-92180);
+    expect(members[0].amount).toBe(-50280); // 92180 × 12/22 = 50280
+    expect(d.lines[0]).toMatchObject({ amount: 92180, potId: "bier" });
+  });
+  it("refuses nothing to return or nobody to return to", () => {
+    expect(() => potSurplusReturned({ potId: "p", expenseAccountId: "x", date: D, amount: cents(0), shares: [{ partyId: "a", weight: 1 }], description: "x" })).toThrow(LedgerError);
+    expect(() => potSurplusReturned({ potId: "p", expenseAccountId: "x", date: D, amount: cents(100), shares: [{ partyId: "a", weight: 0 }], description: "x" })).toThrow(LedgerError);
   });
 });
 
@@ -581,6 +606,26 @@ describe("T26 opening balance", () => {
     })!;
     expect(linesOf(d).at(-1)).toEqual(["GENERAL_RESERVE", -197000]);
     expectBalanced(d);
+  });
+  it("takes over prepaid contribution and members' savings", () => {
+    const d = openingBalance({
+      date: localDate("2026-08-01"),
+      bank: [{ ledgerAccountId: "1000", amount: cents(100000) }],
+      persons: [],
+      activities: [],
+      other: [],
+      contributions: [{ partyId: "isa", amount: cents(-2655) }],
+      savings: [{ partyId: "maren", goalId: "lustrum", amount: cents(-80000) }],
+      reason: "Overgenomen uit Excel",
+    })!;
+    expect(linesOf(d)).toEqual([
+      ["id:1000", 100000],
+      ["CONTRIBUTION_RECEIVABLE", -2655],
+      ["MEMBER_SAVINGS", -80000],
+      ["GENERAL_RESERVE", -17345],
+    ]);
+    expect(d.lines[2]).toMatchObject({ partyId: "maren", savingsGoalId: "lustrum" });
+    expect(d.reason).toBe("Overgenomen uit Excel");
   });
 });
 

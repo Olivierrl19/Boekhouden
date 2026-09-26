@@ -236,8 +236,154 @@ describe("activities, donations and old backups", () => {
     (v1 as unknown as { budgets: unknown[] }).budgets = [];
     for (const a of v1.activities) delete (a as { number?: string }).number;
     const upgraded = migrateState(v1);
-    expect(upgraded.version).toBe(2);
+    expect(upgraded.version).toBe(3);
+    expect(upgraded.memberPlanning).toEqual([]);
     expect(upgraded.accounts.some((a) => a.systemKey === "MEMBER_SAVINGS")).toBe(true);
     expect(upgraded.activities.every((a) => /^A\d\d-\d{3}$/.test(a.number))).toBe(true);
+  });
+});
+
+import { calculateRates, contributionMonthsForPot, expectedContribution, plannedType } from "./ledger";
+import { addMonths } from "@/domain/dates";
+import { parseIngCsv } from "@/domain/bank/ing-csv";
+
+/** A small association set up like the Weknow sheets: fixed woonkamer/bier parts, planning per month. */
+function weknowLike() {
+  const store = new LedgerStore(
+    LedgerStore.install({ name: "Test", fiscalYearStartMonth: 8, startDate: localDate("2026-08-01"), checkingIban: "NL69INGB0123456789", savingsIban: null }),
+  );
+  const s0 = store.getState();
+  const pot = (code: string) => s0.pots.find((p) => p.code === code)!.id;
+  const woon = pot("HUISVESTING");
+  const bier = pot("BORRELS");
+  const rest = pot("CONTRIBUTIE");
+  const truien = store.createPot({ name: "Truien nieuwe lichting", kind: "income" }, FISCUS).id;
+  const J = store.createMemberType({ name: "Jongerejaars", monthly: cents(4649), split: [{ potId: woon, amount: cents(550) }, { potId: bier, amount: cents(1500) }], restPotId: rest, paysGeneral: true, paysYoung: true }, FISCUS);
+  const B = store.createMemberType({ name: "Buitenland", monthly: cents(3149), split: [{ potId: woon, amount: cents(550) }], restPotId: rest, paysGeneral: true, paysYoung: true }, FISCUS);
+  const O = store.createMemberType({ name: "Ouderejaars", monthly: cents(2480), split: [{ potId: woon, amount: cents(350) }], restPotId: rest, paysGeneral: true }, FISCUS);
+  const NL = store.createMemberType({ name: "Nieuwe lichting", monthly: cents(4649), split: [{ potId: woon, amount: cents(550) }, { potId: bier, amount: cents(1500) }], restPotId: truien, rateLikeTypeId: J.id }, FISCUS);
+  return { store, pot, woon, bier, rest, truien, J, B, O, NL };
+}
+
+describe("member planning and contribution split (Weknow workflow)", () => {
+  it("charges the planned type per month and divides it over woonkamer, bier and the rest", () => {
+    const { store, woon, bier, rest, truien, J, O, NL } = weknowLike();
+    const tyga = store.createMember({ firstName: "Tyga", lastName: "", memberTypeId: J.id, joinedOn: localDate("2026-08-01") }, FISCUS);
+    const nieuw = store.createMember({ firstName: "Nieuw lid", lastName: "", memberTypeId: J.id, joinedOn: localDate("2026-11-01") }, FISCUS);
+    expect(tyga.name).toBe("Tyga");
+    store.setPlanning({ memberId: tyga.id, fromMonth: localDate("2026-11-01"), toMonth: localDate("2027-07-01"), memberTypeId: O.id }, FISCUS);
+    store.setPlanning({ memberId: nieuw.id, fromMonth: localDate("2026-11-01"), toMonth: localDate("2026-12-01"), memberTypeId: NL.id }, FISCUS);
+    store.setPlanning({ memberId: tyga.id, fromMonth: localDate("2027-01-01"), toMonth: localDate("2027-01-01"), memberTypeId: null }, FISCUS);
+    const s = () => store.getState();
+    expect(plannedType(s(), tyga, localDate("2026-10-15"))?.name).toBe("Jongerejaars");
+    expect(plannedType(s(), tyga, localDate("2026-11-01"))?.name).toBe("Ouderejaars");
+    expect(plannedType(s(), tyga, localDate("2027-01-01"))).toBeNull();
+    expect(plannedType(s(), nieuw, localDate("2026-10-01"))).toBeNull(); // not a member yet
+    expect(plannedType(s(), nieuw, localDate("2027-02-01"))?.name).toBe("Jongerejaars");
+
+    for (const m of ["2026-10-01", "2026-11-01", "2027-01-01"]) store.chargeContributions(localDate(m), FISCUS);
+    const fy = s().fiscalYears[0];
+    const byPot = resultByPot(s(), fy);
+    // Oct: Tyga J (5,50 + 15,00 + 25,99). Nov: Tyga O (3,50 + 21,30), nieuw NL (5,50 + 15,00 + 26,49 truien). Jan: nieuw J, Tyga afwezig.
+    expect(byPot.get(woon)!.income).toBe(550 + 350 + 550 + 550);
+    expect(byPot.get(bier)!.income).toBe(1500 + 1500 + 1500);
+    expect(byPot.get(truien)!.income).toBe(2599);
+    expect(byPot.get(rest)!.income).toBe(2599 + 2130 + 2599);
+    expect(contributionMonthsForPot(s(), fy, bier)).toEqual(new Map([[tyga.id, 1], [nieuw.id, 2]]));
+    // charged months are fixed: planning them again changes nothing
+    store.setPlanning({ memberId: tyga.id, fromMonth: localDate("2026-10-01"), toMonth: localDate("2026-10-01"), memberTypeId: null }, FISCUS);
+    expect(plannedType(s(), tyga, localDate("2026-10-01"))?.name).toBe("Jongerejaars");
+    expect(store.verify().every((c) => c.ok)).toBe(true);
+  });
+
+  it("refuses fixed parts above the contribution", () => {
+    const { store, woon, J } = weknowLike();
+    expect(() => store.updateMemberType(J.id, { name: "Jongerejaars", monthly: cents(1000), split: [{ potId: woon, amount: cents(1200) }] }, FISCUS)).toThrow(/hoger/);
+  });
+
+  it("calculates the rates from the budget exactly like the Begroting 26-27 sheet", () => {
+    const { store, pot, woon, bier, J, B, O, NL } = weknowLike();
+    const fy = store.getState().fiscalYears[0];
+    // Member-months as in the sheet: 148 J, 12 B, 94 O, 8 NL.
+    const add = (name: string, type: string, months: number, from = "2026-08-01") => {
+      const m = store.createMember({ firstName: name, lastName: "", memberTypeId: type, joinedOn: localDate(from) }, FISCUS);
+      const last = addMonths(localDate(from), months - 1);
+      store.setPlanning({ memberId: m.id, fromMonth: localDate(from), toMonth: last, memberTypeId: type }, FISCUS);
+      if (addMonths(last, 1) <= fy.endDate) store.setPlanning({ memberId: m.id, fromMonth: addMonths(last, 1), toMonth: fy.endDate, memberTypeId: null }, FISCUS);
+      return m;
+    };
+    for (let i = 0; i < 12; i++) add(`J${i}`, J.id, 12); // 144
+    add("Jx", J.id, 4); // 148
+    add("B", B.id, 12); // 12
+    for (let i = 0; i < 7; i++) add(`O${i}`, O.id, 12); // 84
+    add("Ox", O.id, 10); // 94
+    for (let i = 0; i < 4; i++) add(`NL${i}`, NL.id, 2, "2026-11-01"); // 8
+    const months = calculateRates(store.getState(), fy).months;
+    expect([months.get(J.id), months.get(B.id), months.get(O.id), months.get(NL.id)]).toEqual([148, 12, 94, 8]);
+
+    for (const [desc, amount] of [["Pisang", 3000], ["Cadeaus", 60000], ["Fotoboer", 3000], ["Bestuur", 12000], ["Website", 10000], ["Rekening kosten", 40000], ["Toernooien", 200000], ["Activiteiten", 130000], ["Initiatieven", 15000], ["Voorwerpen Gagel", 5000], ["Buitenland", 3000], ["Spaarplan Lustrum", 40000], ["Overig", 20000]] as const) {
+      store.addBudgetLine({ fiscalYearId: fy.id, potId: pot("ALGEMEEN"), kind: "expense", description: desc, amount: cents(amount), sharedBy: "all" }, FISCUS);
+    }
+    store.addBudgetLine({ fiscalYearId: fy.id, potId: pot("ACTIVITEITEN"), kind: "expense", description: "Voor kiesdatum", amount: cents(55000), sharedBy: "young" }, FISCUS);
+    store.addBudgetLine({ fiscalYearId: fy.id, potId: pot("ACTIVITEITEN"), kind: "expense", description: "Na kiesdatum", amount: cents(20000), sharedBy: "young" }, FISCUS);
+    store.addBudgetLine({ fiscalYearId: fy.id, potId: woon, kind: "expense", description: "Huur woonkamer", amount: cents(103005), sharedBy: "none" }, FISCUS);
+    store.addBudgetLine({ fiscalYearId: fy.id, potId: bier, kind: "expense", description: "Bier", amount: cents(234000), sharedBy: "none" }, FISCUS);
+
+    const calc = calculateRates(store.getState(), fy);
+    expect(calc.general).toEqual({ total: 541000, months: 254 });
+    expect(calc.young).toEqual({ total: 75000, months: 160 });
+    const rate = (id: string) => calc.rates.find((r) => r.typeId === id)!.rate;
+    expect([rate(J.id), rate(B.id), rate(O.id), rate(NL.id)]).toEqual([4649, 3149, 2480, 4649]);
+
+    // Expected contribution per pot = planning × rates, divided like the real charges.
+    const expected = expectedContribution(store.getState(), fy);
+    expect(expected.get(bier)).toBe((148 + 8) * 1500);
+    expect(expected.get(woon)).toBe((148 + 12 + 8) * 550 + 94 * 350);
+  });
+});
+
+describe("returning a surplus and charging many at once", () => {
+  it("gives beer money back pro rata and charges a turflijst", () => {
+    const { store, bier, J } = weknowLike();
+    const a = store.createMember({ firstName: "A", lastName: "", memberTypeId: J.id, joinedOn: localDate("2026-08-01") }, FISCUS);
+    const b = store.createMember({ firstName: "B", lastName: "", memberTypeId: J.id, joinedOn: localDate("2026-10-01") }, FISCUS);
+    for (const m of ["2026-08-01", "2026-09-01", "2026-10-01"]) store.chargeContributions(localDate(m), FISCUS);
+    const fy = store.getState().fiscalYears[0];
+    const months = contributionMonthsForPot(store.getState(), fy, bier);
+    expect(months).toEqual(new Map([[a.id, 3], [b.id, 1]]));
+    store.returnPotSurplus({ potId: bier, date: localDate("2026-10-31"), amount: cents(2000), shares: [...months].map(([partyId, weight]) => ({ partyId, weight })), description: "Geld terug bier" }, FISCUS);
+    const d = derive(store.getState());
+    expect(d.partyBalance.get(a.id)).toBe(-1500);
+    expect(d.partyBalance.get(b.id)).toBe(-500);
+    expect(resultByPot(store.getState(), fy).get(bier)).toEqual({ income: 6000, expense: 2000 });
+    expect(() => store.returnPotSurplus({ potId: bier, date: localDate("2026-10-31"), amount: cents(100), shares: [{ partyId: a.id, weight: 1 }], description: "x" }, BESTUUR)).toThrow();
+
+    const n = store.chargeMany({ date: localDate("2026-10-31"), target: { kind: "pot", id: bier }, description: "Turf oktober", items: [{ partyId: a.id, amount: cents(910) }, { partyId: b.id, amount: cents(0) }] }, BESTUUR);
+    expect(n).toBe(1);
+    expect(derive(store.getState()).partyBalance.get(a.id)).toBe(-1500 + 910);
+    expect(() => store.chargeMany({ date: localDate("2026-10-31"), target: { kind: "pot", id: bier }, description: "x", items: [{ partyId: a.id, amount: cents(100) }] }, KASCO)).toThrow();
+    expect(store.verify().every((c) => c.ok)).toBe(true);
+  });
+});
+
+describe("importing an ING CSV", () => {
+  it("checks the saldo against the opening balance and is idempotent", () => {
+    const { store } = weknowLike();
+    const bank = store.getState().bankAccounts.find((x) => x.kind === "checking")!;
+    store.setOpeningBalance({ date: localDate("2026-08-01"), bank: [{ bankAccountId: bank.id, amount: cents(109302) }] }, FISCUS);
+    const file = [
+      '"Datum";"Naam / Omschrijving";"Rekening";"Tegenrekening";"Code";"Af Bij";"Bedrag (EUR)";"Mutatiesoort";"Mededelingen";"Saldo na mutatie";"Tag"',
+      '"20260902";"J. Jansen";"NL69INGB0123456789";"NL44RABO0123456789";"OV";"Bij";"46,49";"Overschrijving";"Contributie";"1.044,91";""',
+      '"20260901";"Verhuurder";"NL69INGB0123456789";"NL91ABNA0417164300";"GT";"Af";"94,60";"Online bankieren";"Huur woonkamer";"998,42";""',
+    ].join("\r\n");
+    const r = store.importTransactions(parseIngCsv(file), FISCUS);
+    expect(r.added).toBe(2);
+    expect(store.importTransactions(parseIngCsv(file), FISCUS)).toMatchObject({ added: 0, duplicates: 2 });
+    expect(store.verify().every((c) => c.ok)).toBe(true);
+    // A gap (wrong opening balance) is refused.
+    const other = weknowLike().store;
+    const bank2 = other.getState().bankAccounts.find((x) => x.kind === "checking")!;
+    other.setOpeningBalance({ date: localDate("2026-08-01"), bank: [{ bankAccountId: bank2.id, amount: cents(100000) }] }, FISCUS);
+    expect(() => other.importTransactions(parseIngCsv(file), FISCUS)).toThrow(/Saldo sluit niet aan/);
   });
 });

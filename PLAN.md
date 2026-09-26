@@ -675,3 +675,29 @@ Per boekjaar met vergelijking vorig jaar; PDF (@react-pdf/renderer) en Excel (ex
 | Voorstellen | Deterministisch uitgebreid: omschrijving met "contributie" → contributie; "spaar/sparen" → spaarplan; bedrag = open contributie of veelvoud van het maandtarief → contributie. Nooit automatisch geboekt. |
 
 Nieuwe templates: **T32** spaargeld verrekend (D 1740 party+doel · C 1300 party), **T33** inleg/uitbetaling spaarplan (1099 ↔ 1740). T01 debiteert nu 1305 en verdeelt de baten over potjes.
+
+## 16. Aanvullingen v4 (werkwijze We know You know, uit hun Excel)
+
+Geanalyseerd: Balans 01-08, Financiën BJ25-26 (bankmaanden, Activiteiten, Ledenrekening per maand, Contributie
+begroot/betaald, sparen lustrum, Balla bijdrage), Begroting BJ26-27 (Begroting, Contributie & ledenplanning,
+Huur & Bier) en het Financieel jaarverslag 25-26. De processen blijven gelijk; de app volgt ze:
+
+| Werkwijze in Excel | In de app |
+|---|---|
+| ING-export per maand (NL- en EN-kolommen, zonder volgnummer) | **ING CSV-lezer** (`src/domain/bank/ing-csv.ts`): `;` en `,`, met of zonder "Saldo na mutatie". Idempotentiesleutel = hash van datum, bedrag, tegenrekening, naam, mededeling + teller voor gelijke regels op één dag. Met saldokolom sluit de import aan op de beginbalans. |
+| Contributie & ledenplanning: per lid per maand jongerejaars / buitenland / ouderejaars / nieuwe lichting / afwezig | **Ledenplanning** (`memberPlanning`, State v3): soort lid per lid per maand, overschrijft de standaardsoort; null = afwezig. Opgelegde maanden liggen vast. |
+| Contributie = algemeen deel + woonkamer (5,50 / 3,50) + bier (15,00); nieuwe lichting: rest naar truien | Per **soort lid vaste delen per potje** + een **rest-potje** (`split`, `restPotId`); T01 verdeelt exact zo. |
+| Begroting: tarief = posten alle leden ÷ lid-maanden + jongerejaarsposten ÷ jongerejaars/buitenland-maanden + vaste delen | **Contributie berekenen uit de begroting** (`calculateRates`): per begrotingsregel "betaald door" (alle leden / jongerejaars / vaste bijdrage), per soort "betaalt mee aan"; exacte integer-rekening, afronding half-omhoog. Reproduceert 46,49 / 31,49 / 24,80. |
+| Jaarverslag: begroting vs realisatie, vorig jaar | Begrotingsregel heeft **Vorig jaar** (`lastYear`, informatief). |
+| "Geld terug bier kiet": overschot naar rato van betaalde maanden | **T34 overschot potje terug naar leden** (D kosten potje · C 1300 per lid, largest remainder); gewichten = maanden met een deel voor dat potje (`contributionMonthsForPot`). |
+| Activiteiten met ander dispuut: kosten naar aantal, bier 60/40, "Verrekenen" | **Deel ander dispuut berekenen** (`src/domain/joint-activity.ts`) → vast bedrag voor het andere dispuut in de afrekening (negatief = wij betalen hen). |
+| Aanwezigheid 0,5 / 1,5 (kort / met date) | Afrekenen met **aantal in honderdsten**; "gelijk" = 1,00. |
+| Ledenrekening-kolommen (turf 0,70, maaltijd, drankjes, extra bij/af) | **Bedragen op ledenrekeningen zetten**: één kolom per keer, prijs × aantal of bedrag. |
+| Ledenrekening als tegoed ("LR ophogen") | Ongewijzigd: betaling op de rekening van het lid = tegoed; gecombineerde overboekingen splitsen bij toewijzen. |
+| Balans: reserveringen, voorraad | Eigen rekeningen via `install({ extraAccounts, pots })`; beginbalans (T26) neemt ook **vooruitbetaalde contributie** (1305) en **spaargeld per lid** (1740) over. |
+| Leden met alleen een voornaam | Achternaam optioneel; naam wijzigen kan (bijv. "Nieuw lid 26-1"). |
+
+Overzetten: een script (buiten de publieke repository, want persoonsgegevens) bouwt via de store-API de
+beginsituatie per 1-8-2026 en controleert elk bedrag tegen de Excel-bestanden; resultaat is een back-up (.json)
+die de fiscus terugzet. Open punten staan in de overdracht aan de opdrachtgever (o.a. ledenrekening op de balans
+wijkt af van het tabblad Ledenrekening juli; wie zijn de crediteuren).

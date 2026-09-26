@@ -1,0 +1,5 @@
+"Datum";"Naam / Omschrijving";"Rekening";"Tegenrekening";"Code";"Af Bij";"Bedrag (EUR)";"Mutatiesoort";"Mededelingen";"Saldo na mutatie";"Tag"
+"20260903";"Kosten Zakelijk Betalingsverkeer";"NL69INGB0123456789";"";"DV";"Af";"12,50";"Diversen";"01-08-2026 / 31-08-2026";"1.078,90";""
+"20260902";"J. Jansen";"NL69INGB0123456789";"NL44RABO0123456789";"OV";"Bij";"46,49";"Overschrijving";"Contributie september";"1.091,40";""
+"20260902";"J. Jansen";"NL69INGB0123456789";"NL44RABO0123456789";"OV";"Bij";"46,49";"Overschrijving";"Contributie september";"1.044,91";""
+"20260901";"Woningstichting";"NL69INGB0123456789";"NL91ABNA0417164300";"GT";"Af";"94,60";"Online bankieren";"Huur woonkamer";"998,42";""

@@ -21,6 +21,7 @@ import {
   mirrorEntry,
   savingsSettled,
   openingBalance,
+  potSurplusReturned,
   reserveDotation,
   validateDraft,
   yearClose,
@@ -30,8 +31,8 @@ import {
   type SettlementShareInput,
 } from "@/domain/ledger/templates";
 import { LedgerError, type AccountRef, type EntryDraft, type LineDraft, type SystemKey } from "@/domain/ledger/types";
-import { DEFAULT_ACCOUNTS, DEFAULT_POTS, type AccountType } from "@/domain/ledger/chart";
-import { cents, formatEuro, sum, type Cents } from "@/domain/money";
+import { DEFAULT_ACCOUNTS, DEFAULT_POTS, type AccountType, type DefaultAccount, type DefaultPot } from "@/domain/ledger/chart";
+import { allocate, cents, formatEuro, sum, type Cents } from "@/domain/money";
 import { addDays, addMonths, fiscalYearFor, firstOfMonth, formatMonthNl, localDate, type LocalDate } from "@/domain/dates";
 import { isValidIban, normalizeIban } from "@/domain/bank/iban";
 import type { NormalizedBankTransaction } from "@/domain/bank/types";
@@ -63,7 +64,23 @@ export interface Account {
 }
 export interface Pot { id: string; code: string; name: string; incomeAccountId: string; expenseAccountId: string }
 export interface FiscalYear { id: string; label: string; startDate: LocalDate; endDate: LocalDate; status: "open" | "closing" | "closed"; nextEntryNumber: number }
-export interface MemberType { id: string; name: string; monthly: Cents; active: boolean }
+export interface MemberType {
+  id: string;
+  name: string;
+  monthly: Cents;
+  active: boolean;
+  /** Fixed part of the monthly contribution per pot (e.g. woonkamer € 5,50, bier € 15,00). */
+  split?: { potId: string; amount: Cents }[];
+  /** Pot that receives the rest; null = divided with the general contribution key. */
+  restPotId?: string | null;
+  /** For the contribution calculator: shares in the costs for all members / for young members. */
+  paysGeneral?: boolean;
+  paysYoung?: boolean;
+  /** Calculator: this type pays the same rate as another type (e.g. nieuwe lichting = jongerejaars). */
+  rateLikeTypeId?: string | null;
+}
+/** Planned member type for one month (null = afwezig: no contribution that month). */
+export interface PlanningCell { memberId: string; month: LocalDate; memberTypeId: string | null }
 export interface Party {
   id: string;
   kind: PartyKind;
@@ -127,10 +144,21 @@ export interface Claim {
   decidedAt: string | null;
 }
 export interface AuditRecord { id: number; at: string; actor: string; action: string; data: unknown; reason: string | null; prevHash: string | null; hash: string }
-export interface BudgetLine { id: string; fiscalYearId: string; potId: string; kind: "income" | "expense"; description: string; amount: Cents }
+export interface BudgetLine {
+  id: string;
+  fiscalYearId: string;
+  potId: string;
+  kind: "income" | "expense";
+  description: string;
+  amount: Cents;
+  /** Who pays for this cost in the contribution calculation (default: all members). */
+  sharedBy?: "all" | "young" | "none";
+  /** Realised amount last year, for comparison (e.g. taken over from the old spreadsheet). */
+  lastYear?: Cents | null;
+}
 
 export interface State {
-  version: 2;
+  version: 3;
   settings: {
     name: string;
     paymentIban: string;
@@ -152,6 +180,8 @@ export interface State {
   entries: Entry[];
   activities: Activity[];
   contributionMonths: { memberId: string; month: LocalDate; entryId: string }[];
+  /** Member type per member per month (overrides the member's default type). */
+  memberPlanning: PlanningCell[];
   claims: Claim[];
   audit: AuditRecord[];
   seq: number;
@@ -357,7 +387,12 @@ export function donationsByGiver(state: State, fy: FiscalYear): { partyId: strin
 export function migrateState(raw: unknown): State {
   const s = raw as State & { version: number; budgets: unknown[] };
   if (!s || !Array.isArray(s.entries)) throw new Error("Dit is geen back-up van deze boekhouding");
-  if (s.version === 2) return s;
+  if (s.version === 3) return s;
+  if (s.version === 2) {
+    (s as State).memberPlanning = [];
+    s.version = 3;
+    return s;
+  }
   if (s.version !== 1) throw new Error(`Onbekende versie ${s.version}`);
   const nextId = (p: string) => `${p}${(++s.seq).toString(36)}`;
   const add = (code: string) => {
@@ -385,8 +420,8 @@ export function migrateState(raw: unknown): State {
     counters.set(prefix, n);
     a.number = `${prefix}${String(n).padStart(3, "0")}`;
   }
-  s.version = 2;
-  return s;
+  (s as { version: number }).version = 2;
+  return migrateState(s);
 }
 
 export function currentFiscalYear(state: State, today: LocalDate): FiscalYear | null {
@@ -395,6 +430,116 @@ export function currentFiscalYear(state: State, today: LocalDate): FiscalYear | 
     [...state.fiscalYears].sort((a, b) => (a.startDate < b.startDate ? 1 : -1))[0] ??
     null
   );
+}
+
+/** The member type that applies to a member in a month: planning first, else the member's own type. null = no contribution. */
+export function plannedType(state: State, member: Party, month: LocalDate): MemberType | null {
+  const m = member.member;
+  if (!m) return null;
+  const first = firstOfMonth(month);
+  const cell = state.memberPlanning.find((c) => c.memberId === member.id && c.month === first);
+  if (m.leftOn && m.leftOn < first) return null;
+  if (cell) return cell.memberTypeId ? state.memberTypes.find((t) => t.id === cell.memberTypeId) ?? null : null;
+  if (m.joinedOn > first) return null;
+  return state.memberTypes.find((t) => t.id === m.memberTypeId) ?? null;
+}
+
+/**
+ * How one month of contribution of a type is divided over pots, in cents: the type's fixed parts
+ * first, the rest to its rest pot or with the general contribution key. Always sums to `monthly`.
+ */
+export function contributionSplit(state: State, type: MemberType): { potId: string; amount: Cents }[] {
+  const fixed = (type.split ?? []).filter((p) => p.amount > 0);
+  const rest = type.monthly - sum(fixed.map((p) => p.amount));
+  if (rest < 0) throw new LedgerError(`De vaste delen van "${type.name}" zijn hoger dan de contributie`);
+  const out = new Map<string, number>();
+  for (const p of fixed) out.set(p.potId, (out.get(p.potId) ?? 0) + p.amount);
+  if (rest > 0) {
+    if (type.restPotId) out.set(type.restPotId, (out.get(type.restPotId) ?? 0) + rest);
+    else {
+      const key = state.settings.contributionKey.filter((k) => k.weight > 0);
+      if (!key.length) throw new LedgerError("Stel eerst de verdeling van de contributie over de potjes in");
+      const parts = allocate(cents(rest), key.map((k) => k.weight));
+      key.forEach((k, i) => out.set(k.potId, (out.get(k.potId) ?? 0) + parts[i]));
+    }
+  }
+  return [...out].filter(([, a]) => a !== 0).map(([potId, amount]) => ({ potId, amount: cents(amount) }));
+}
+
+/** Months each member was charged contribution with a part for this pot (e.g. bier) in a year. */
+export function contributionMonthsForPot(state: State, fy: FiscalYear, potId: string): Map<string, number> {
+  const d = derive(state);
+  const account = d.accountByKey.get("CONTRIBUTION_RECEIVABLE")?.id;
+  const out = new Map<string, number>();
+  for (const e of state.entries) {
+    if (e.template !== "T01" || e.fiscalYearId !== fy.id || d.reversedIds.has(e.id)) continue;
+    if (!e.lines.some((l) => l.potId === potId)) continue;
+    const member = e.lines.find((l) => l.accountId === account)?.partyId;
+    if (member) out.set(member, (out.get(member) ?? 0) + 1);
+  }
+  return out;
+}
+
+/** Planned member-months per member type in a fiscal year (from the planning). */
+export function plannedMemberMonths(state: State, fy: FiscalYear): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const p of state.parties) {
+    if (!p.member) continue;
+    for (let m = fy.startDate; m <= fy.endDate; m = addMonths(m, 1)) {
+      const t = plannedType(state, p, m);
+      if (t) out.set(t.id, (out.get(t.id) ?? 0) + 1);
+    }
+  }
+  return out;
+}
+
+/** Expected contribution per pot for a year: planning × rates, divided like the real charges. */
+export function expectedContribution(state: State, fy: FiscalYear): Map<string, Cents> {
+  const out = new Map<string, number>();
+  for (const [typeId, months] of plannedMemberMonths(state, fy)) {
+    const t = state.memberTypes.find((x) => x.id === typeId)!;
+    if (t.monthly === 0) continue;
+    for (const part of contributionSplit(state, t)) out.set(part.potId, (out.get(part.potId) ?? 0) + part.amount * months);
+  }
+  return out as Map<string, Cents>;
+}
+
+export interface RateCalculation {
+  months: Map<string, number>;
+  general: { total: Cents; months: number };
+  young: { total: Cents; months: number };
+  rates: { typeId: string; rate: Cents; fixed: Cents; general: boolean; young: boolean; likeTypeId: string | null }[];
+}
+
+/**
+ * Contribution rates from the budget (the "Begroting" sheet): costs for all members are divided
+ * over the member-months of types that pay general costs, young-member costs over the months of
+ * types that pay those; each type's rate = its fixed parts (woonkamer, bier) + those shares,
+ * rounded to the cent. A type can follow another type's rate (nieuwe lichting = jongerejaars).
+ */
+export function calculateRates(state: State, fy: FiscalYear, buffer: Cents = cents(0)): RateCalculation {
+  const months = plannedMemberMonths(state, fy);
+  const lines = state.budgets.filter((b) => b.fiscalYearId === fy.id && b.kind === "expense");
+  const generalTotal = sum(lines.filter((b) => (b.sharedBy ?? "all") === "all").map((b) => b.amount)) + buffer;
+  const youngTotal = sum(lines.filter((b) => b.sharedBy === "young").map((b) => b.amount));
+  const monthsOf = (pred: (t: MemberType) => boolean) => state.memberTypes.filter(pred).reduce((n, t) => n + (months.get(t.id) ?? 0), 0);
+  const gMonths = monthsOf((t) => !!t.paysGeneral);
+  const yMonths = monthsOf((t) => !!t.paysYoung);
+  const own = (t: MemberType) => {
+    const fixed = sum((t.split ?? []).map((p) => p.amount));
+    // fixed + general/gMonths + young/yMonths, rounded half up, in exact integer arithmetic.
+    const g = t.paysGeneral && gMonths ? 1 : 0;
+    const y = t.paysYoung && yMonths ? 1 : 0;
+    const den = (g ? gMonths : 1) * (y ? yMonths : 1);
+    const num = fixed * den + (g ? generalTotal * (y ? yMonths : 1) : 0) + (y ? youngTotal * (g ? gMonths : 1) : 0);
+    return { rate: cents(Math.floor((2 * num + den) / (2 * den))), fixed: cents(fixed) };
+  };
+  const rates = state.memberTypes.filter((t) => t.active).map((t) => {
+    const like = t.rateLikeTypeId ? state.memberTypes.find((x) => x.id === t.rateLikeTypeId) : null;
+    const r = own(like ?? t);
+    return { typeId: t.id, rate: r.rate, fixed: cents(sum((t.split ?? []).map((p) => p.amount))), general: !!t.paysGeneral, young: !!t.paysYoung, likeTypeId: like?.id ?? null };
+  });
+  return { months, general: { total: cents(generalTotal), months: gMonths }, young: { total: cents(youngTotal), months: yMonths }, rates };
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +576,16 @@ export interface AssignPart {
   donorId?: string | null; // informational, for donations to a pot
   amount: Cents;
   description?: string;
+}
+
+export interface MemberTypeInput {
+  name: string;
+  monthly: Cents;
+  split?: { potId: string; amount: Cents }[];
+  restPotId?: string | null;
+  paysGeneral?: boolean;
+  paysYoung?: boolean;
+  rateLikeTypeId?: string | null;
 }
 
 export interface ImportResult { added: number; duplicates: number; autoAssigned: number; accounts: string[] }
@@ -626,19 +781,24 @@ export class LedgerStore {
     checkingIban: string;
     savingsIban: string | null;
     isDemo?: boolean;
+    /** Extra ledger accounts (e.g. own reserves or stock) on top of the default chart. */
+    extraAccounts?: DefaultAccount[];
+    /** Own pots instead of the default ones (account codes refer to the chart). */
+    pots?: DefaultPot[];
   }): State {
     for (const iban of [input.checkingIban, input.savingsIban].filter((x): x is string => !!x)) {
       if (!isValidIban(iban)) throw new LedgerError(`Ongeldig IBAN: ${iban}`);
     }
     const s: State = {
-      version: 2,
+      version: 3,
       settings: { name: input.name, paymentIban: normalizeIban(input.checkingIban), paymentAccountName: input.name, fiscalYearStartMonth: input.fiscalYearStartMonth, isDemo: !!input.isDemo, contributionKey: [] },
       accounts: [], pots: [], budgets: [], savingsGoals: [], fiscalYears: [], memberTypes: [], parties: [], bankAccounts: [],
-      bankTransactions: [], entries: [], activities: [], contributionMonths: [], claims: [], audit: [], seq: 0,
+      bankTransactions: [], entries: [], activities: [], contributionMonths: [], memberPlanning: [], claims: [], audit: [], seq: 0,
     };
     const nextId = (p: string) => `${p}${(++s.seq).toString(36)}`;
     const byCode = new Map<string, string>();
-    for (const a of DEFAULT_ACCOUNTS) {
+    for (const a of [...DEFAULT_ACCOUNTS, ...(input.extraAccounts ?? [])]) {
+      if (byCode.has(a.code)) throw new LedgerError(`Rekeningnummer ${a.code} komt twee keer voor`);
       if (a.bank === "savings" && !input.savingsIban) continue;
       const id = nextId("a");
       byCode.set(a.code, id);
@@ -654,7 +814,12 @@ export class LedgerStore {
         });
       }
     }
-    for (const p of DEFAULT_POTS) {
+    const pots = input.pots ?? DEFAULT_POTS;
+    for (const code of ["CONTRIBUTIE", "ALGEMEEN", "RESERVERINGEN", "DONATIES"]) {
+      if (!pots.some((p) => p.code === code)) throw new LedgerError(`Potje ${code} ontbreekt`);
+    }
+    for (const p of pots) {
+      if (!byCode.has(p.income!) || !byCode.has(p.expense!)) throw new LedgerError(`Potje ${p.name} verwijst naar een onbekende rekening`);
       s.pots.push({ id: nextId("p"), code: p.code, name: p.name, incomeAccountId: byCode.get(p.income!)!, expenseAccountId: byCode.get(p.expense!)! });
     }
     s.settings.contributionKey = [{ potId: s.pots.find((p) => p.code === "CONTRIBUTIE")!.id, weight: 100 }];
@@ -676,14 +841,42 @@ export class LedgerStore {
     return fy;
   }
 
-  setOpeningBalance(input: { date: LocalDate; bank: { bankAccountId: string; amount: Cents }[] }, actor: Actor) {
+  setOpeningBalance(
+    input: {
+      date: LocalDate;
+      bank: { bankAccountId: string; amount: Cents }[];
+      /** Balance per person account (> 0 owes the association, < 0 credit). */
+      persons?: { partyId: string; amount: Cents }[];
+      contributions?: { partyId: string; amount: Cents }[];
+      savings?: { partyId: string; goalId: string; amount: Cents }[];
+      other?: { accountId: string; amount: Cents; description?: string }[];
+      reason?: string;
+    },
+    actor: Actor,
+  ) {
     require(actor, "admin");
     return this.transact((s) => {
       if (s.entries.some((e) => e.template === "T26")) throw new LedgerError("Er is al een beginbalans");
+      const party = (id: string) => {
+        const p = s.parties.find((x) => x.id === id);
+        if (!p) throw new LedgerError("Onbekende persoon in de beginbalans");
+        return p;
+      };
+      for (const o of input.other ?? []) {
+        const acc = s.accounts.find((a) => a.id === o.accountId);
+        if (!acc || acc.type === "income" || acc.type === "expense" || acc.partyKind || acc.systemKey === "BANK_SUSPENSE" || s.bankAccounts.some((b) => b.ledgerAccountId === acc.id)) {
+          throw new LedgerError(`Rekening ${acc?.code ?? "?"} kan niet los in de beginbalans`);
+        }
+      }
       const draft = openingBalance({
         date: input.date,
         bank: input.bank.map((b) => ({ ledgerAccountId: s.bankAccounts.find((x) => x.id === b.bankAccountId)!.ledgerAccountId, amount: b.amount })),
-        persons: [], activities: [], other: [],
+        persons: (input.persons ?? []).map((p) => ({ partyId: p.partyId, partyKind: party(p.partyId).kind, amount: p.amount })),
+        contributions: (input.contributions ?? []).map((c) => ({ partyId: party(c.partyId).id, amount: c.amount })),
+        savings: input.savings ?? [],
+        activities: [],
+        other: input.other ?? [],
+        reason: input.reason,
       });
       if (draft) this.post(s, draft, actor);
     });
@@ -691,28 +884,89 @@ export class LedgerStore {
 
   // -- members and externals ------------------------------------------------
 
-  createMemberType(input: { name: string; monthly: Cents }, actor: Actor): MemberType {
+  createMemberType(input: MemberTypeInput, actor: Actor): MemberType {
     require(actor, "admin");
     return this.transact((s) => {
       if (!input.name.trim()) throw new LedgerError("Naam is verplicht");
-      if (input.monthly < 0) throw new LedgerError("Contributie kan niet negatief zijn");
       if (s.memberTypes.some((t) => t.name.toLowerCase() === input.name.trim().toLowerCase())) throw new LedgerError("Deze soort bestaat al");
       const t: MemberType = { id: this.id(s, "t"), name: input.name.trim(), monthly: input.monthly, active: true };
+      this.applyTypeOptions(s, t, input);
       s.memberTypes.push(t);
       this.audit(s, actor, "member_type.create", t);
       return t;
     });
   }
 
-  updateMemberType(id: string, input: { name: string; monthly: Cents }, actor: Actor) {
+  updateMemberType(id: string, input: MemberTypeInput, actor: Actor) {
     require(actor, "admin");
     this.transact((s) => {
       const t = s.memberTypes.find((x) => x.id === id);
       if (!t) throw new LedgerError("Onbekende soort lid");
-      if (input.monthly < 0) throw new LedgerError("Contributie kan niet negatief zijn");
-      this.audit(s, actor, "member_type.update", { id, before: { ...t }, after: input });
+      if (!input.name.trim()) throw new LedgerError("Naam is verplicht");
+      const before = structuredClone(t);
       t.name = input.name.trim();
-      t.monthly = input.monthly;
+      this.applyTypeOptions(s, t, input);
+      this.audit(s, actor, "member_type.update", { id, before, after: structuredClone(t) });
+    });
+  }
+
+  private applyTypeOptions(s: State, t: MemberType, input: MemberTypeInput) {
+    if (!Number.isSafeInteger(input.monthly) || input.monthly < 0) throw new LedgerError("Contributie kan niet negatief zijn");
+    t.monthly = input.monthly;
+    if (input.split !== undefined) {
+      for (const p of input.split) {
+        if (!s.pots.some((x) => x.id === p.potId)) throw new LedgerError("Onbekend potje in de verdeling");
+        if (!Number.isSafeInteger(p.amount) || p.amount < 0) throw new LedgerError("Een vast deel kan niet negatief zijn");
+      }
+      if (new Set(input.split.map((p) => p.potId)).size !== input.split.length) throw new LedgerError("Elk potje mag maar één keer in de verdeling staan");
+      t.split = input.split.filter((p) => p.amount > 0);
+    }
+    if (input.restPotId !== undefined) {
+      if (input.restPotId && !s.pots.some((x) => x.id === input.restPotId)) throw new LedgerError("Onbekend potje voor de rest");
+      t.restPotId = input.restPotId;
+    }
+    if (input.paysGeneral !== undefined) t.paysGeneral = input.paysGeneral;
+    if (input.paysYoung !== undefined) t.paysYoung = input.paysYoung;
+    if (input.rateLikeTypeId !== undefined) {
+      if (input.rateLikeTypeId === t.id) throw new LedgerError("Een soort kan niet het tarief van zichzelf volgen");
+      t.rateLikeTypeId = input.rateLikeTypeId;
+    }
+    contributionSplit(s, t); // throws when the fixed parts exceed the contribution
+  }
+
+  /** Take over calculated rates (only types that have no fixed parts above the new rate). */
+  setMemberTypeRates(rates: { typeId: string; rate: Cents }[], actor: Actor) {
+    require(actor, "admin");
+    this.transact((s) => {
+      for (const r of rates) {
+        const t = s.memberTypes.find((x) => x.id === r.typeId);
+        if (!t) throw new LedgerError("Onbekende soort lid");
+        const before = t.monthly;
+        this.applyTypeOptions(s, t, { name: t.name, monthly: r.rate });
+        this.audit(s, actor, "member_type.rate", { id: t.id, name: t.name, before, after: r.rate });
+      }
+    });
+  }
+
+  /** Plan a member's type for a range of months (null = afwezig). */
+  setPlanning(input: { memberId: string; fromMonth: LocalDate; toMonth: LocalDate; memberTypeId: string | null }, actor: Actor) {
+    require(actor, "admin");
+    this.transact((s) => {
+      const member = s.parties.find((p) => p.id === input.memberId && p.member);
+      if (!member) throw new LedgerError("Onbekend lid");
+      if (input.memberTypeId && !s.memberTypes.some((t) => t.id === input.memberTypeId)) throw new LedgerError("Onbekende soort lid");
+      const from = firstOfMonth(input.fromMonth);
+      const to = firstOfMonth(input.toMonth);
+      if (to < from) throw new LedgerError("De eindmaand ligt vóór de beginmaand");
+      let n = 0;
+      for (let m = from; m <= to; m = addMonths(m, 1)) {
+        if (s.contributionMonths.some((c) => c.memberId === member.id && c.month === m)) continue; // already charged: stays as it is
+        s.memberPlanning = s.memberPlanning.filter((c) => !(c.memberId === member.id && c.month === m));
+        s.memberPlanning.push({ memberId: member.id, month: m, memberTypeId: input.memberTypeId });
+        n++;
+        if (n > 240) throw new LedgerError("Kies een kortere periode");
+      }
+      this.audit(s, actor, "member.planning", { ...input, months: n });
     });
   }
 
@@ -729,10 +983,10 @@ export class LedgerStore {
   createMember(input: { firstName: string; lastName: string; email?: string | null; memberTypeId: string; cohort?: number | null; joinedOn: LocalDate; ibans?: string[] }, actor: Actor): Party {
     require(actor, "edit");
     return this.transact((s) => {
-      if (!input.firstName.trim() || !input.lastName.trim()) throw new LedgerError("Voor- en achternaam zijn verplicht");
+      if (!input.firstName.trim()) throw new LedgerError("Voornaam is verplicht");
       if (!s.memberTypes.some((t) => t.id === input.memberTypeId)) throw new LedgerError("Kies een soort lid");
       const p: Party = {
-        id: this.id(s, "m"), kind: "member", name: `${input.firstName.trim()} ${input.lastName.trim()}`,
+        id: this.id(s, "m"), kind: "member", name: `${input.firstName.trim()} ${input.lastName.trim()}`.trim(),
         email: input.email?.trim().toLowerCase() || null, ibans: [], active: true,
         member: { firstName: input.firstName.trim(), lastName: input.lastName.trim(), memberTypeId: input.memberTypeId, cohort: input.cohort ?? null, joinedOn: input.joinedOn, leftOn: null },
       };
@@ -743,12 +997,19 @@ export class LedgerStore {
     });
   }
 
-  updateMember(id: string, input: { email: string | null; memberTypeId: string; cohort: number | null; ibans: string[]; leftOn: LocalDate | null }, actor: Actor) {
+  updateMember(id: string, input: { firstName?: string; lastName?: string; email: string | null; memberTypeId: string; cohort: number | null; ibans: string[]; leftOn: LocalDate | null }, actor: Actor) {
     require(actor, "edit");
     this.transact((s) => {
       const p = s.parties.find((x) => x.id === id && x.member);
       if (!p?.member) throw new LedgerError("Onbekend lid");
       const before = structuredClone(p);
+      if (input.firstName !== undefined) {
+        if (!input.firstName.trim()) throw new LedgerError("Voornaam is verplicht");
+        p.member.firstName = input.firstName.trim();
+        p.member.lastName = (input.lastName ?? "").trim();
+        p.name = `${p.member.firstName} ${p.member.lastName}`.trim();
+      }
+      if (!s.memberTypes.some((t) => t.id === input.memberTypeId)) throw new LedgerError("Kies een soort lid");
       p.email = input.email?.trim().toLowerCase() || null;
       p.member.memberTypeId = input.memberTypeId;
       p.member.cohort = input.cohort;
@@ -1102,15 +1363,14 @@ export class LedgerStore {
   private chargeMonth(s: State, monthInput: LocalDate, actor: Actor): number {
     const month = firstOfMonth(monthInput);
     const income = s.accounts.find((a) => a.systemKey === "CONTRIBUTION")!;
-    const split = s.settings.contributionKey.filter((k) => k.weight > 0);
-    if (!split.length) throw new LedgerError("Stel eerst de verdeling van de contributie over de potjes in");
     let n = 0;
     for (const p of s.parties) {
-      const m = p.member;
-      if (!m || m.joinedOn > month || (m.leftOn && m.leftOn < month)) continue;
+      if (!p.member) continue;
       if (s.contributionMonths.some((c) => c.memberId === p.id && c.month === month)) continue;
-      const type = s.memberTypes.find((t) => t.id === m.memberTypeId)!;
-      if (type.monthly === 0) continue;
+      const type = plannedType(s, p, month);
+      if (!type || type.monthly === 0) continue;
+      // Weights in cents make allocate() reproduce the exact amounts per pot.
+      const split = contributionSplit(s, type).map((x) => ({ potId: x.potId, weight: x.amount as number }));
       const entry = this.post(s, contributionCharged({ chargeId: `${p.id}:${month}`, partyId: p.id, month, amount: type.monthly, incomeAccountId: income.id, split, description: `Contributie ${formatMonthNl(month)} (${type.name})` }), actor);
       s.contributionMonths.push({ memberId: p.id, month, entryId: entry.id });
       n++;
@@ -1147,6 +1407,17 @@ export class LedgerStore {
         target = { kind: "pot", potId: pot.id, accountId: input.amount > 0 ? pot.incomeAccountId : pot.expenseAccountId };
       }
       this.post(s, chargedToPerson({ partyId: party.id, partyKind: party.kind, date: input.date, amount: input.amount, target, description: input.description.trim() }), actor);
+    });
+  }
+
+  /** Put amounts on several accounts at once (turflijst, a shared meal, extra bij/af), one entry per person. */
+  chargeMany(input: { date: LocalDate; target: { kind: "activity" | "pot"; id: string }; description: string; items: { partyId: string; amount: Cents }[] }, actor: Actor): number {
+    require(actor, "edit");
+    return this.transact(() => {
+      const items = input.items.filter((i) => i.amount !== 0);
+      if (!items.length) throw new LedgerError("Vul voor minimaal één persoon een bedrag in");
+      for (const it of items) this.chargePerson({ partyId: it.partyId, date: input.date, amount: it.amount, target: input.target, description: input.description }, actor);
+      return items.length;
     });
   }
 
@@ -1286,7 +1557,7 @@ export class LedgerStore {
     require(actor, "admin");
     this.transact((s) => {
       const e = s.entries.find((x) => x.id === entryId);
-      if (e && e.sourceType && e.sourceType !== "journal_entry" && !["T29", "T23", "T21", "T22"].includes(e.template)) {
+      if (e && e.sourceType && e.sourceType !== "journal_entry" && !["T29", "T23", "T21", "T22", "T34"].includes(e.template)) {
         throw new LedgerError("Deze boeking hoort bij een document (bank, activiteit, declaratie); maak het daar ongedaan");
       }
       this.reverse(s, entryId, reason, actor);
@@ -1350,14 +1621,22 @@ export class LedgerStore {
     });
   }
 
-  createPot(input: { name: string; kind: "expense" | "income" | "both" }, actor: Actor): Pot {
+  createPot(input: { name: string; kind: "expense" | "income" | "both"; incomeAccountId?: string; expenseAccountId?: string }, actor: Actor): Pot {
     require(actor, "admin");
     return this.transact((s) => {
       const name = input.name.trim();
       if (!name) throw new LedgerError("Naam is verplicht");
       if (s.pots.some((p) => p.name.toLowerCase() === name.toLowerCase())) throw new LedgerError("Dit potje bestaat al");
       const general = s.pots.find((p) => p.code === "ALGEMEEN")!;
-      const pot: Pot = { id: this.id(s, "p"), code: name.toUpperCase().replace(/[^A-Z0-9]+/g, "_"), name, incomeAccountId: general.incomeAccountId, expenseAccountId: general.expenseAccountId };
+      const check = (id: string | undefined, type: AccountType) => {
+        if (id && s.accounts.find((a) => a.id === id)?.type !== type) throw new LedgerError(`Kies een ${type === "income" ? "opbrengsten" : "kosten"}rekening`);
+        return id;
+      };
+      const pot: Pot = {
+        id: this.id(s, "p"), code: name.toUpperCase().replace(/[^A-Z0-9]+/g, "_"), name,
+        incomeAccountId: check(input.incomeAccountId, "income") ?? general.incomeAccountId,
+        expenseAccountId: check(input.expenseAccountId, "expense") ?? general.expenseAccountId,
+      };
       s.pots.push(pot);
       this.audit(s, actor, "pot.create", pot);
       return pot;
@@ -1438,6 +1717,20 @@ export class LedgerStore {
         total += amount;
       }
       return { members, total: cents(total) };
+    });
+  }
+
+  /** Give (part of) a pot's surplus back to members' accounts, pro rata to their weights (T34). */
+  returnPotSurplus(input: { potId: string; date: LocalDate; amount: Cents; shares: { partyId: string; weight: number }[]; description: string }, actor: Actor) {
+    require(actor, "approve");
+    this.transact((s) => {
+      const pot = s.pots.find((p) => p.id === input.potId);
+      if (!pot) throw new LedgerError("Kies een potje");
+      for (const sh of input.shares) {
+        if (s.parties.find((p) => p.id === sh.partyId)?.kind !== "member") throw new LedgerError("Alleen leden kunnen geld terugkrijgen op hun rekening");
+      }
+      this.post(s, potSurplusReturned({ potId: pot.id, expenseAccountId: pot.expenseAccountId, date: input.date, amount: input.amount, shares: input.shares, description: input.description.trim() || `Overschot ${pot.name} terug naar leden` }), actor);
+      this.audit(s, actor, "pot.surplus.return", { pot: pot.name, amount: input.amount, members: input.shares.length });
     });
   }
 

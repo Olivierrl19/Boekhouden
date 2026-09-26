@@ -67,6 +67,8 @@ tests/                 DB integration and property tests (unit tests sit next to
 
 `prototype/` is a standalone React app that runs the same domain code (`src/domain/**`) against an
 in-browser ledger (`prototype/src/ledger.ts`) that enforces the DB trigger rules in `post()`.
+The prototype follows the workflow of the association "We know You know" (PLAN.md §16). Never commit
+their real data (names, amounts, IBANs): the repository is public; migrations live outside it.
 `npm run prototype` builds it into ONE self-contained file, `docs/index.html` (GitHub Pages / double-click).
 Commit the rebuilt `docs/index.html` whenever prototype or domain code changes. Data lives in
 localStorage; backup/restore is a JSON file.

@@ -24,21 +24,24 @@ van rol (fiscus, bestuur, kascommissie of een lid) om te zien wat iedereen ziet 
 
 Wat werkt in het prototype:
 
-- **Bank**: Rabobank-CSV importeren (dubbel importeren boekt niets dubbel, gaten in het saldo worden
+- **Bank**: ING- of Rabobank-CSV importeren (dubbel importeren boekt niets dubbel, gaten in het saldo worden
   geweigerd), transacties met de hand toevoegen (een latere import herkent ze), toewijzen ("waar
   geboekt") met voorstellen op bekend IBAN, Tikkie en omschrijving, splitsen, ongedaan maken, en een
   lid of externe direct aanmaken vanuit een bankregel.
-- **Contributie**: per maand opleggen per soort lid, zien wie welke maand betaald heeft, alle
-  contributiebetalingen in één keer toewijzen, en de contributie-inkomsten met een verdeelsleutel
-  over potjes verdelen.
+- **Contributie**: ledenplanning per lid per maand (jongerejaars, buitenland, ouderejaars, nieuwe
+  lichting, afwezig), per maand opleggen, zien wie welke maand betaald heeft, alle contributiebetalingen
+  in één keer toewijzen, vaste delen per soort lid (woonkamer, bier) en de rest naar een potje, het
+  tarief berekenen uit de begroting, en een overschot (geld terug bier) teruggeven naar rato van de maanden.
 - **Spaarplannen** per lid en spaardoel (bijv. lustrumreis): inleggen via de bank, zien wie op schema
   ligt, en spaargeld verrekenen met wat iemand moet betalen.
 - **Debiteurenlijst** met rekening, contributie, totaal en spaargeld per persoon; maandmail per
   persoon (via je eigen mailprogramma).
 - **Activiteiten** met vast nummer (A26-001) en "nog te verdelen"; afrekenen gelijk, naar streepjes, met
-  vast bedrag (ook een nieuwe externe direct toevoegen) en dispuutsdeel.
+  vast bedrag (ook een nieuwe externe direct toevoegen) en dispuutsdeel; aantallen als 0,5 of 1,5; het deel
+  van een ander dispuut berekenen (naar aantal, drank 60/40). Klik op een naam of rij om te selecteren.
+- **Ledenrekeningen**: een kolom bedragen in één keer boeken (turflijst × prijs, maaltijd, extra bij/af).
 - **Externen** met saldo, betaalverzoektekst voor Tikkie/WhatsApp en bedragen op hun rekening zetten.
-- **Begroting** met eigen regels per potje, kopiëren van vorig jaar, verwachte contributie automatisch,
+- **Begroting** met eigen regels per potje, kolom vorig jaar, per regel wie meebetaalt, kopiëren van vorig jaar, verwachte contributie automatisch,
   eigen potjes; **donaties** van oud-leden met overzicht per gever.
 - Declaraties met foto van de bon, kasboek, rapportages (balans, resultaat per potje vs begroting,
   vorig jaar), journaal, bestemmingsreserves, memoriaal, boekjaar afsluiten met controlelijst,

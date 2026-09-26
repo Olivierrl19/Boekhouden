@@ -10,7 +10,8 @@ import { cents, formatEuro, sum, type Cents } from "@/domain/money";
 import { formatDateNl, localDate } from "@/domain/dates";
 import type { SettlementShareInput, ShareMethod } from "@/domain/ledger/templates";
 import { today } from "../ledger";
-import { A, Empty, Field, PageHeader, ReadOnlyNotice, Select, parseAmount, useAction, useApp, useCan, useLedger } from "./core";
+import { A, Empty, Field, PageHeader, ReadOnlyNotice, Select, isControl, parseAmount, useAction, useApp, useCan, useLedger } from "./core";
+import { jointShare, parseHundredths } from "@/domain/joint-activity";
 import { lineTarget } from "./labels";
 
 export function ActivitiesPage() {
@@ -187,8 +188,9 @@ function SettlementForm({ activityId, balance }: { activityId: string; balance: 
       return {
         partyId: r.partyId,
         partyKind: party?.kind,
-        method: r.method,
-        weight: r.method === "weight" ? Number(r.weight || 0) : undefined,
+        // "Gelijk" = weight 1,00, so it combines with fractional counts (hundredths) in one settlement.
+        method: r.method === "fixed" ? r.method : ("weight" as ShareMethod),
+        weight: r.method === "weight" ? parseHundredths(r.weight || "0") : r.method === "equal" ? 100 : undefined,
         fixedAmount: r.method === "fixed" ? parseAmount(r.fixed) : undefined,
       };
     });
@@ -204,7 +206,7 @@ function SettlementForm({ activityId, balance }: { activityId: string; balance: 
     <Card className="print:hidden">
       <CardHeader>
         <CardTitle>Afrekenen: <Money value={balance} /> verdelen</CardTitle>
-        <CardDescription>Vink aan wie meedeed. Gelijk verdelen, naar streepjes (gewicht), of een vast bedrag (bijv. voor een ander dispuut, dat regelt het onderling). De verdeling klopt altijd tot op de cent.</CardDescription>
+        <CardDescription>Klik op wie meedeed. Gelijk verdelen, naar aantal (bijv. 1,5 met date, 0,5 als iemand kort was, of het aantal streepjes), of een vast bedrag (bijv. voor een ander dispuut). De verdeling klopt altijd tot op de cent.</CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
         <div className="flex flex-wrap gap-2">
@@ -212,6 +214,12 @@ function SettlementForm({ activityId, balance }: { activityId: string; balance: 
           <Button variant="outline" size="sm" onClick={() => setRows(rows.map((r) => { const p = state.parties.find((x) => x.id === r.partyId); return p?.kind === "member" ? { ...r, include: true } : r; }))}>Alle leden</Button>
           <Button variant="outline" size="sm" onClick={() => setRows(rows.map((r) => ({ ...r, include: false })))}>Niemand</Button>
         </div>
+        <JointCalculator balance={balance} ours={rows.filter((r) => r.include && state.parties.find((p) => p.id === r.partyId)?.kind === "member").length} onApply={(partyId, amount) => {
+          const i = rows.findIndex((r) => r.partyId === partyId);
+          const fixed = (amount / 100).toFixed(2).replace(".", ",");
+          if (i >= 0) update(i, { include: true, method: "fixed", fixed });
+          else setRows([...rows, { partyId, include: true, method: "fixed", weight: "1", fixed }]);
+        }} />
         <div className="flex flex-wrap items-end gap-2 rounded-md border border-dashed p-3 text-sm">
           <span className="w-full text-muted-foreground">Deed er een ander dispuut of een gast mee die nog niet in de lijst staat? Voeg toe met een vast bedrag:</span>
           <Input placeholder="Naam, bijv. Dispuut Bacchus" value={newExternal.name} onChange={(e) => setNewExternal({ ...newExternal, name: e.target.value })} className="w-56" />
@@ -233,16 +241,16 @@ function SettlementForm({ activityId, balance }: { activityId: string; balance: 
                 if (filter && !label.toLowerCase().includes(filter.toLowerCase())) return null;
                 const amount = preview.amounts.get(r.partyId ?? "__dispuut__");
                 return (
-                  <TableRow key={r.partyId ?? "dispuut"} className={r.include ? "" : "opacity-60"}>
-                    <TableCell><input type="checkbox" checked={r.include} onChange={(e) => update(i, { include: e.target.checked })} /></TableCell>
+                  <TableRow key={r.partyId ?? "dispuut"} className={`cursor-pointer ${r.include ? "" : "opacity-60"}`} onClick={(e) => { if (!isControl(e.target)) update(i, { include: !r.include }); }}>
+                    <TableCell><input type="checkbox" checked={r.include} onChange={(e) => update(i, { include: e.target.checked })} aria-label={label} /></TableCell>
                     <TableCell>{label}{party?.kind === "external" && <Badge variant="outline" className="ml-2">extern</Badge>}</TableCell>
                     <TableCell>
                       <Select value={r.method} onChange={(e) => update(i, { method: e.target.value as ShareMethod, include: true })} className="w-32">
-                        <option value="equal">Gelijk</option><option value="weight">Streepjes</option><option value="fixed">Vast bedrag</option>
+                        <option value="equal">Gelijk</option><option value="weight">Aantal</option><option value="fixed">Vast bedrag</option>
                       </Select>
                     </TableCell>
                     <TableCell>
-                      {r.method === "weight" && <Input value={r.weight} onChange={(e) => update(i, { weight: e.target.value.replace(/\D/g, ""), include: true })} className="w-20" inputMode="numeric" />}
+                      {r.method === "weight" && <Input value={r.weight} onChange={(e) => update(i, { weight: e.target.value.replace(/[^\d,.]/g, ""), include: true })} className="w-20" inputMode="decimal" title="Bijv. 1, 1,5 of 0,5" />}
                       {r.method === "fixed" && <Input value={r.fixed} onChange={(e) => update(i, { fixed: e.target.value, include: true })} className="w-24" placeholder="0,00" />}
                     </TableCell>
                     <TableCell className="text-right">{r.include && amount !== undefined && <Money value={amount} />}</TableCell>
@@ -265,5 +273,72 @@ function SettlementForm({ activityId, balance }: { activityId: string; balance: 
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+/** Share with another dispuut: headcount for food, a weighting for drinks (60/40), like the sheet. */
+function JointCalculator({ balance, ours, onApply }: { balance: Cents; ours: number; onApply: (partyId: string, amount: Cents) => void }) {
+  const { store, actor } = useApp();
+  const { state } = useLedger();
+  const run = useAction();
+  const [open, setOpen] = useState(false);
+  const externals = state.parties.filter((p) => p.kind === "external" && p.active).sort((a, b) => a.name.localeCompare(b.name));
+  const [f, setF] = useState({ partyId: "", newName: "", ours: "", theirs: "", drinks: "", paidByThem: "", factor: "1,5" });
+  const set = (k: keyof typeof f) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => setF({ ...f, [k]: e.target.value });
+  let result: ReturnType<typeof jointShare> | null = null;
+  let error = "";
+  let normal = 0;
+  try {
+    const paidByThem = f.paidByThem.trim() ? parseAmount(f.paidByThem) : cents(0);
+    const drinks = f.drinks.trim() ? parseAmount(f.drinks) : cents(0);
+    normal = balance + paidByThem - drinks;
+    result = jointShare({
+      ours: parseHundredths(f.ours || String(ours)),
+      theirs: parseHundredths(f.theirs || "0"),
+      normalCosts: cents(normal),
+      drinkCosts: drinks,
+      beerFactor: parseHundredths(f.factor || "1"),
+      paidByThem,
+    });
+  } catch (e) {
+    error = (e as Error).message;
+  }
+  if (!open) {
+    return <div><Button variant="outline" size="sm" onClick={() => setOpen(true)}>Samen met een ander dispuut? Bereken hun deel</Button></div>;
+  }
+  return (
+    <div className="flex flex-col gap-3 rounded-md border p-3 text-sm">
+      <div className="font-medium">Deel van het andere dispuut</div>
+      <p className="text-muted-foreground">Eten en overige kosten naar aantal personen; drank met een verhouding (1,5 = iemand van het andere dispuut telt als 1,5 persoon, de gebruikelijke 60/40). Nog te verdelen bij ons: {formatEuro(balance)} (wat wij betaalden).</p>
+      <div className="grid gap-3 sm:grid-cols-4">
+        <Field label="Ander dispuut">
+          <Select value={f.partyId} onChange={set("partyId")}>
+            <option value="">Nieuw…</option>
+            {externals.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </Select>
+        </Field>
+        {!f.partyId && <Field label="Naam nieuw dispuut"><Input value={f.newName} onChange={set("newName")} placeholder="bijv. Meteoor" /></Field>}
+        <Field label="Aantal van ons" hint={`Leeg = aangevinkte leden (${ours})`}><Input value={f.ours} onChange={set("ours")} placeholder={String(ours)} inputMode="decimal" /></Field>
+        <Field label="Aantal van hen"><Input value={f.theirs} onChange={set("theirs")} inputMode="decimal" /></Field>
+        <Field label="Waarvan drank (totaal beide)"><Input value={f.drinks} onChange={set("drinks")} placeholder="0,00" /></Field>
+        <Field label="Door hen betaald"><Input value={f.paidByThem} onChange={set("paidByThem")} placeholder="0,00" /></Field>
+        <Field label="Drankverhouding"><Input value={f.factor} onChange={set("factor")} inputMode="decimal" /></Field>
+      </div>
+      {error ? <span className="text-red-600">{error}</span> : result && (
+        <div>
+          Overige kosten {formatEuro(cents(normal))} · hun deel {formatEuro(result.theirShare)} · ons deel {formatEuro(result.ourShare)} ·{" "}
+          <strong>{result.settle >= 0 ? `zij betalen ons ${formatEuro(result.settle)}` : `wij betalen hen ${formatEuro(cents(-result.settle))}`}</strong>
+        </div>
+      )}
+      <div className="flex gap-2">
+        <Button size="sm" disabled={!result} onClick={() => run(() => {
+          if (!result) return;
+          const partyId = f.partyId || store.createExternal({ name: f.newName }, actor).id;
+          onApply(partyId, result.settle);
+          setOpen(false);
+        }, "Deel van het andere dispuut staat in de verdeling (vast bedrag)")}>Zet in de verdeling</Button>
+        <Button size="sm" variant="ghost" onClick={() => setOpen(false)}>Sluiten</Button>
+      </div>
+    </div>
   );
 }

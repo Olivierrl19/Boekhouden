@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Money } from "@/components/money";
 import { decodeBankFile, looksLikeRabobankCsv, parseRabobankCsv } from "@/domain/bank/rabobank-csv";
+import { looksLikeIngCsv, parseIngCsv } from "@/domain/bank/ing-csv";
 import { payerIban } from "@/domain/bank/suggestions";
 import { formatIban } from "@/domain/bank/iban";
 import { formatDateNl, localDate } from "@/domain/dates";
@@ -27,7 +28,7 @@ export function BankPage() {
   const run = useAction();
   const fileRef = useRef<HTMLInputElement>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const [result, setResult] = useState<(ImportResult & { file: string }) | null>(null);
+  const [result, setResult] = useState<(ImportResult & { file: string; checked: boolean }) | null>(null);
   const [tab, setTab] = useState<"open" | "all">("open");
   const [showCash, setShowCash] = useState(false);
   const [showManual, setShowManual] = useState(false);
@@ -38,9 +39,10 @@ export function BankPage() {
   async function onFile(file: File) {
     const text = decodeBankFile(await file.arrayBuffer());
     run(() => {
-      if (!looksLikeRabobankCsv(text)) throw new Error("Dit is geen Rabobank CSV-export. Kies in Rabo Internetbankieren: Transacties downloaden → CSV.");
-      const r = store.importTransactions(parseRabobankCsv(text), actor, { fileName: file.name });
-      setResult({ ...r, file: file.name });
+      const txs = looksLikeIngCsv(text) ? parseIngCsv(text) : looksLikeRabobankCsv(text) ? parseRabobankCsv(text) : null;
+      if (!txs) throw new Error("Dit bestand wordt niet herkend. ING: Mijn ING → Af- en bijschrijvingen downloaden → (punt)kommagescheiden CSV. Rabobank: Transacties downloaden → CSV.");
+      const r = store.importTransactions(txs, actor, { fileName: file.name });
+      setResult({ ...r, file: file.name, checked: txs.some((t) => t.balanceAfter !== null) });
     });
     if (fileRef.current) fileRef.current.value = "";
   }
@@ -51,7 +53,7 @@ export function BankPage() {
         {canEdit && (
           <>
             <input ref={fileRef} type="file" accept=".csv,text/csv" className="hidden" onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
-            <Button onClick={() => fileRef.current?.click()}><Upload /> Rabobank-CSV importeren</Button>
+            <Button onClick={() => fileRef.current?.click()}><Upload /> Bankbestand importeren (ING/Rabobank)</Button>
             <Button variant="outline" onClick={() => setShowManual((v) => !v)}><Plus /> Transactie met de hand</Button>
             <Button variant="outline" onClick={() => setShowCash((v) => !v)}><Coins /> Kasmutatie</Button>
           </>
@@ -79,7 +81,8 @@ export function BankPage() {
       {result && (
         <div className="mb-4 rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm dark:border-emerald-900 dark:bg-emerald-950/40">
           <strong>{result.file}</strong>: {result.added} nieuw, {result.duplicates} al eerder geïmporteerd
-          {result.autoAssigned > 0 && `, ${result.autoAssigned} interne overboeking(en) automatisch geboekt`}. Banksaldo sluit aan op de bank.
+          {result.autoAssigned > 0 && `, ${result.autoAssigned} interne overboeking(en) automatisch geboekt`}.{" "}
+          {result.checked ? "Banksaldo sluit aan op de bank." : "Dit bestand heeft geen saldokolom; controleer het banksaldo zelf (Boeken → Controle)."}
         </div>
       )}
 

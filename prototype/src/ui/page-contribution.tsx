@@ -5,10 +5,10 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableFooter, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Money } from "@/components/money";
-import { allocate, cents, formatEuro, sum } from "@/domain/money";
-import { firstOfMonth, formatDateNl, formatMonthNl, localDate } from "@/domain/dates";
-import { contributionOverview, currentFiscalYear, today, type FiscalYear } from "../ledger";
-import { A, Empty, PageHeader, ReadOnlyNotice, Select, useAction, useApp, useCan, useLedger } from "./core";
+import { formatEuro, sum, type Cents } from "@/domain/money";
+import { addMonths, firstOfMonth, formatDateNl, formatMonthNl, localDate, type LocalDate } from "@/domain/dates";
+import { contributionMonthsForPot, contributionOverview, contributionSplit, currentFiscalYear, plannedType, resultByPot, today, type FiscalYear } from "../ledger";
+import { A, Empty, Field, PageHeader, ReadOnlyNotice, Select, isControl, parseAmount, useAction, useApp, useCan, useLedger } from "./core";
 
 const MONTH_SHORT = ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"];
 
@@ -87,7 +87,7 @@ export function ContributionPage() {
                 <TableRow key={r.party.id}>
                   <TableCell className="sticky left-0 bg-card whitespace-nowrap">
                     <A to={`persoon/${r.party.id}`}>{r.party.name}</A>
-                    <span className="ml-2 text-xs text-muted-foreground">{state.memberTypes.find((t) => t.id === r.party.member?.memberTypeId)?.name}</span>
+                    <span className="ml-2 text-xs text-muted-foreground">{plannedType(state, r.party, today())?.name ?? "afwezig"}</span>
                   </TableCell>
                   {shownMonths.map((m) => {
                     const c = r.months.get(m);
@@ -107,6 +107,10 @@ export function ContributionPage() {
           </Table>
         </CardContent>
       </Card>
+
+      <Planning fy={fy} />
+
+      <SurplusReturn fy={fy} />
 
       <ContributionKey />
     </div>
@@ -147,7 +151,7 @@ function BulkAssign() {
             {candidates.map((c) => {
               const v = get(c.t.id, c);
               return (
-                <TableRow key={c.t.id}>
+                <TableRow key={c.t.id} className="cursor-pointer" onClick={(e) => { if (!isControl(e.target)) setChoice({ ...choice, [c.t.id]: { ...v, on: !v.on } }); }}>
                   <TableCell><input type="checkbox" checked={v.on} onChange={(e) => setChoice({ ...choice, [c.t.id]: { ...v, on: e.target.checked } })} /></TableCell>
                   <TableCell className="whitespace-nowrap">{formatDateNl(c.t.bookingDate)}</TableCell>
                   <TableCell><div>{c.t.counterpartyName}</div><div className="text-xs text-muted-foreground">{c.t.description}</div></TableCell>
@@ -184,11 +188,21 @@ function ContributionKey() {
   const parsed = state.pots.map((p) => ({ potId: p.id, weight: Number(weights[p.id] || 0) })).filter((k) => k.weight > 0);
   const total = parsed.reduce((s, k) => s + k.weight, 0);
   const types = state.memberTypes.filter((t) => t.monthly > 0);
+  // Preview with the key as currently typed (not yet saved).
+  const typeSplit = (typeId: string): Map<string, Cents> => {
+    const t = types.find((x) => x.id === typeId)!;
+    try {
+      const preview = { ...state, settings: { ...state.settings, contributionKey: parsed } };
+      return new Map(contributionSplit(preview, t).map((x) => [x.potId, x.amount]));
+    } catch {
+      return new Map();
+    }
+  };
   return (
     <Card>
       <CardHeader>
         <CardTitle>Verdeling van de contributie over de potjes</CardTitle>
-        <CardDescription>Contributie is inkomsten voor het dispuut. Met deze verdeelsleutel komt elk opgelegd bedrag automatisch als inkomsten in de potjes (tot op de cent). Wijzigen geldt vanaf de volgende maand die je oplegt.</CardDescription>
+        <CardDescription>Contributie is inkomsten voor het dispuut. Vaste delen per soort lid (zoals woonkamer en bier) stel je in bij Leden → Soorten leden; wat overblijft gaat naar het rest-potje van die soort of wordt met deze verdeelsleutel verdeeld. De kolommen rechts tonen per soort lid waar elke euro heen gaat. Wijzigen geldt vanaf de volgende maand die je oplegt.</CardDescription>
       </CardHeader>
       <CardContent className="p-0">
         <Table>
@@ -209,9 +223,8 @@ function ContributionKey() {
                   <TableCell>{isAdmin ? <Input value={weights[p.id] ?? ""} onChange={(e) => setWeights({ ...weights, [p.id]: e.target.value.replace(/\D/g, "") })} className="h-8 w-20" placeholder="0" /> : w || ""}</TableCell>
                   <TableCell className="text-right">{total && w ? `${((w / total) * 100).toFixed(0)}%` : ""}</TableCell>
                   {types.map((t) => {
-                    const idx = parsed.findIndex((k) => k.potId === p.id);
-                    const parts = total ? allocate(t.monthly, parsed.map((k) => k.weight)) : [];
-                    return <TableCell key={t.id} className="text-right">{idx >= 0 && <Money value={parts[idx]} />}</TableCell>;
+                    const amount = typeSplit(t.id).get(p.id);
+                    return <TableCell key={t.id} className="text-right">{amount ? <Money value={amount} /> : null}</TableCell>;
                   })}
                 </TableRow>
               );
@@ -222,7 +235,7 @@ function ContributionKey() {
               <TableCell>Totaal</TableCell>
               <TableCell>{total}</TableCell>
               <TableCell className="text-right">{total ? "100%" : ""}</TableCell>
-              {types.map((t) => <TableCell key={t.id} className="text-right"><Money value={total ? t.monthly : cents(0)} /></TableCell>)}
+              {types.map((t) => <TableCell key={t.id} className="text-right"><Money value={sum([...typeSplit(t.id).values()])} /></TableCell>)}
             </TableRow>
           </TableFooter>
         </Table>
@@ -232,6 +245,173 @@ function ContributionKey() {
           </div>
         )}
       </CardContent>
+    </Card>
+  );
+}
+
+/** Member type per member per month, like the "Contributie & ledenplanning" sheet. */
+function Planning({ fy }: { fy: FiscalYear }) {
+  const { store, actor } = useApp();
+  const { state } = useLedger();
+  const isAdmin = useCan("admin");
+  const run = useAction();
+  const [onwards, setOnwards] = useState(true);
+  const [open, setOpen] = useState(false);
+  const months: LocalDate[] = [];
+  for (let m = fy.startDate; m <= fy.endDate; m = addMonths(m, 1)) months.push(m);
+  const members = state.parties
+    .filter((p) => p.member && (p.active || state.memberPlanning.some((c) => c.memberId === p.id && c.month >= fy.startDate && c.month <= fy.endDate)))
+    .sort((a, b) => (a.member!.joinedOn < b.member!.joinedOn ? -1 : a.member!.joinedOn > b.member!.joinedOn ? 1 : a.name.localeCompare(b.name)));
+  const charged = new Set(state.contributionMonths.map((c) => `${c.memberId}|${c.month}`));
+  const counts = months.map((m) => {
+    const byType = new Map<string, number>();
+    for (const p of members) {
+      const t = plannedType(state, p, m);
+      if (t) byType.set(t.id, (byType.get(t.id) ?? 0) + 1);
+    }
+    return byType;
+  });
+  return (
+    <Card>
+      <CardHeader className="flex-row flex-wrap items-end justify-between gap-3">
+        <div>
+          <CardTitle>Ledenplanning {fy.label}</CardTitle>
+          <CardDescription>Per lid per maand: jongerejaars, buitenland, ouderejaars, nieuwe lichting of afwezig. Bij het opleggen van de contributie telt de planning; al opgelegde maanden liggen vast (grijs).</CardDescription>
+        </div>
+        <Button variant="outline" onClick={() => setOpen((v) => !v)}>{open ? "Verbergen" : "Planning tonen"}</Button>
+      </CardHeader>
+      {open && (
+        <CardContent className="flex flex-col gap-3 p-0">
+          {isAdmin && (
+            <label className="flex items-center gap-2 px-5 text-sm">
+              <input type="checkbox" checked={onwards} onChange={(e) => setOnwards(e.target.checked)} /> Een wijziging geldt ook voor de maanden erna (t/m {formatMonthNl(fy.endDate)})
+            </label>
+          )}
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="sticky left-0 bg-card">Lid</TableHead>
+                {months.map((m) => <TableHead key={m} className="px-1 text-center">{MONTH_SHORT[Number(m.slice(5, 7)) - 1]}</TableHead>)}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {members.map((p) => (
+                <TableRow key={p.id}>
+                  <TableCell className="sticky left-0 bg-card whitespace-nowrap"><A to={`persoon/${p.id}`}>{p.name}</A></TableCell>
+                  {months.map((m) => {
+                    const t = plannedType(state, p, m);
+                    const locked = charged.has(`${p.id}|${m}`) || !isAdmin;
+                    return (
+                      <TableCell key={m} className="px-0.5">
+                        {locked ? (
+                          <span className={`block rounded px-1 text-center text-xs ${charged.has(`${p.id}|${m}`) ? "bg-muted" : ""}`}>{t ? shortName(t.name) : "—"}</span>
+                        ) : (
+                          <select
+                            aria-label={`${p.name} ${formatMonthNl(m)}`}
+                            className="w-full rounded border border-input bg-background px-0.5 py-0.5 text-xs"
+                            value={t?.id ?? "none"}
+                            onChange={(e) => run(() => store.setPlanning({ memberId: p.id, fromMonth: m, toMonth: onwards ? fy.endDate : m, memberTypeId: e.target.value === "none" ? null : e.target.value }, actor))}
+                          >
+                            {state.memberTypes.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+                            <option value="none">Afwezig</option>
+                          </select>
+                        )}
+                      </TableCell>
+                    );
+                  })}
+                </TableRow>
+              ))}
+            </TableBody>
+            <TableFooter>
+              {state.memberTypes.filter((t) => counts.some((c) => c.has(t.id))).map((t) => (
+                <TableRow key={t.id}>
+                  <TableCell className="sticky left-0 bg-muted whitespace-nowrap">Aantal {t.name.toLowerCase()}</TableCell>
+                  {counts.map((c, i) => <TableCell key={i} className="px-1 text-center">{c.get(t.id) ?? 0}</TableCell>)}
+                </TableRow>
+              ))}
+            </TableFooter>
+          </Table>
+        </CardContent>
+      )}
+    </Card>
+  );
+}
+
+function shortName(name: string) {
+  return name.length <= 6 ? name : name.slice(0, 5) + "…";
+}
+
+/** "Geld terug bier": return a pot's surplus to members, pro rata to the months they paid for it. */
+function SurplusReturn({ fy }: { fy: FiscalYear }) {
+  const { store, actor } = useApp();
+  const { state, d } = useLedger();
+  const canApprove = useCan("approve");
+  const run = useAction();
+  const splitPots = [...new Set(state.memberTypes.flatMap((t) => (t.split ?? []).map((p) => p.potId)))];
+  const [potId, setPotId] = useState(splitPots[0] ?? state.pots[0]?.id ?? "");
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState<string>(today() > fy.endDate ? fy.endDate : today());
+  const [off, setOff] = useState<Set<string>>(new Set());
+  const [open, setOpen] = useState(false);
+  if (!canApprove || !splitPots.length) return null;
+  const months = contributionMonthsForPot(state, fy, potId);
+  const r = resultByPot(state, fy).get(potId);
+  const surplus = r ? r.income - r.expense : 0;
+  const rows = [...months].map(([partyId, n]) => ({ party: d.partyById.get(partyId)!, n })).sort((a, b) => a.party.name.localeCompare(b.party.name));
+  const shares = rows.filter((x) => !off.has(x.party.id)).map((x) => ({ partyId: x.party.id, weight: x.n }));
+  const totalMonths = shares.reduce((s, x) => s + x.weight, 0);
+  let perMonth = "";
+  try {
+    if (amount.trim() && totalMonths) perMonth = formatEuro(Math.round(parseAmount(amount) / totalMonths) as Cents);
+  } catch {
+    perMonth = "";
+  }
+  const potName = d.potById.get(potId)?.name ?? "";
+  return (
+    <Card>
+      <CardHeader className="flex-row flex-wrap items-end justify-between gap-3">
+        <div>
+          <CardTitle>Overschot teruggeven aan leden</CardTitle>
+          <CardDescription>Bijvoorbeeld “geld terug bier”: wat er van het bierdeel van de contributie over is, gaat terug op de ledenrekening, naar rato van het aantal maanden dat iemand ervoor betaald heeft.</CardDescription>
+        </div>
+        <Button variant="outline" onClick={() => setOpen((v) => !v)}>{open ? "Verbergen" : "Openen"}</Button>
+      </CardHeader>
+      {open && (
+        <CardContent className="flex flex-col gap-4">
+          <div className="grid gap-3 sm:grid-cols-4 sm:items-end">
+            <Field label="Potje"><Select value={potId} onChange={(e) => { setPotId(e.target.value); setOff(new Set()); }}>{splitPots.map((id) => <option key={id} value={id}>{d.potById.get(id)?.name}</option>)}</Select></Field>
+            <div className="text-sm"><div className="text-muted-foreground">Saldo {potName} {fy.label}</div><Money value={surplus} className="font-medium" /></div>
+            <Field label="Terug te geven" hint={perMonth && `${perMonth} per maand`}><Input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder={surplus > 0 ? (surplus / 100).toFixed(2).replace(".", ",") : "0,00"} /></Field>
+            <Field label="Datum"><Input type="date" value={date} onChange={(e) => setDate(e.target.value)} /></Field>
+          </div>
+          {rows.length === 0 ? <Empty>In {fy.label} is nog geen contributie met een deel voor {potName} opgelegd.</Empty> : (
+            <Table>
+              <TableHeader><TableRow><TableHead className="w-8" /><TableHead>Lid</TableHead><TableHead className="text-right">Maanden betaald</TableHead></TableRow></TableHeader>
+              <TableBody>
+                {rows.map((x) => {
+                  const on = !off.has(x.party.id);
+                  const toggle = () => setOff((prev) => { const n = new Set(prev); if (n.has(x.party.id)) n.delete(x.party.id); else n.add(x.party.id); return n; });
+                  return (
+                    <TableRow key={x.party.id} className="cursor-pointer" onClick={(e) => { if (!isControl(e.target)) toggle(); }}>
+                      <TableCell><input type="checkbox" checked={on} onChange={toggle} aria-label={x.party.name} /></TableCell>
+                      <TableCell>{x.party.name}</TableCell>
+                      <TableCell className="text-right">{x.n}</TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          )}
+          <div>
+            <Button disabled={!shares.length || !amount.trim()} onClick={() => run(() => {
+              const total = parseAmount(amount);
+              if (!window.confirm(`${formatEuro(total)} uit ${potName} verdelen over ${shares.length} leden (${totalMonths} maanden)?`)) return;
+              store.returnPotSurplus({ potId, date: localDate(date), amount: total, shares, description: `Geld terug ${potName.toLowerCase()} ${fy.label}` }, actor);
+              setAmount("");
+            }, "Teruggegeven op de ledenrekeningen")}>Teruggeven op de ledenrekeningen</Button>
+          </div>
+        </CardContent>
+      )}
     </Card>
   );
 }
